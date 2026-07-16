@@ -2125,6 +2125,37 @@ mod tests {
     }
 
     #[test]
+    fn test_build_command_quotes_remote_tmux_session_name() -> Result<()> {
+        let command = build_command_posix(
+            Some("tmux".to_string()),
+            &[
+                "-N".to_string(),
+                "attach-session".to_string(),
+                "-t".to_string(),
+                "=api; $(touch /tmp/not-run) 'worker'".to_string(),
+            ],
+            &HashMap::default(),
+            None,
+            None,
+            HashMap::default(),
+            PathStyle::Unix,
+            "/bin/sh",
+            ShellKind::Posix,
+            Vec::new(),
+            "user@host",
+            Interactive::Yes,
+        )?;
+
+        assert_eq!(
+            command.args.last().map(String::as_str),
+            Some(
+                "cd && exec env tmux -N attach-session -t '=api; $(touch /tmp/not-run) '\"'worker'\""
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_build_command_quotes_env_assignment() -> Result<()> {
         let mut input_env = HashMap::default();
         input_env.insert("ZED$(echo foo)".to_string(), "value".to_string());

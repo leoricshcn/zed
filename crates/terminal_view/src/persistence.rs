@@ -24,6 +24,15 @@ use crate::{
     terminal_panel::{TerminalPanel, new_terminal_pane},
 };
 
+const SHELL_TERMINAL_KIND: &str = "shell";
+const REMOTE_TMUX_TERMINAL_KIND: &str = "remote_tmux";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SerializedTerminalSource {
+    Shell,
+    RemoteTmux(String),
+}
+
 pub(crate) fn serialize_pane_group(
     pane_group: &PaneGroup,
     active_pane: &Entity<Pane>,
@@ -413,6 +422,10 @@ impl Domain for TerminalDb {
         sql! (
             ALTER TABLE terminals ADD COLUMN custom_title TEXT;
         ),
+        sql! (
+            ALTER TABLE terminals ADD COLUMN terminal_kind TEXT NOT NULL DEFAULT "shell";
+            ALTER TABLE terminals ADD COLUMN remote_tmux_session_name TEXT;
+        ),
     ];
 }
 
@@ -503,5 +516,134 @@ impl TerminalDb {
             FROM terminals
             WHERE item_id = ? AND workspace_id = ?
         }
+    }
+
+    pub async fn save_terminal_source(
+        &self,
+        item_id: ItemId,
+        workspace_id: WorkspaceId,
+        remote_tmux_session_name: Option<String>,
+    ) -> Result<()> {
+        let terminal_kind = if remote_tmux_session_name.is_some() {
+            REMOTE_TMUX_TERMINAL_KIND
+        } else {
+            SHELL_TERMINAL_KIND
+        };
+        self.write(move |conn| {
+            let query = "INSERT INTO terminals
+                (item_id, workspace_id, terminal_kind, remote_tmux_session_name)
+                VALUES (?1, ?2, ?3, ?4)
+                ON CONFLICT (workspace_id, item_id) DO UPDATE SET
+                    terminal_kind = excluded.terminal_kind,
+                    remote_tmux_session_name = excluded.remote_tmux_session_name";
+            let mut statement = Statement::prepare(conn, query)?;
+            let mut next_index = statement.bind(&item_id, 1)?;
+            next_index = statement.bind(&workspace_id, next_index)?;
+            next_index = statement.bind(&terminal_kind, next_index)?;
+            statement.bind(&remote_tmux_session_name, next_index)?;
+            statement.exec()
+        })
+        .await
+    }
+
+    query! {
+        fn get_terminal_source_row(
+            item_id: ItemId,
+            workspace_id: WorkspaceId
+        ) -> Result<Option<(String, Option<String>)>> {
+            SELECT terminal_kind, remote_tmux_session_name
+            FROM terminals
+            WHERE item_id = ? AND workspace_id = ?
+        }
+    }
+
+    pub fn get_terminal_source(
+        &self,
+        item_id: ItemId,
+        workspace_id: WorkspaceId,
+    ) -> Result<Option<SerializedTerminalSource>> {
+        let Some((terminal_kind, session_name)) =
+            self.get_terminal_source_row(item_id, workspace_id)?
+        else {
+            return Ok(None);
+        };
+        match (terminal_kind.as_str(), session_name) {
+            (SHELL_TERMINAL_KIND, _) => Ok(Some(SerializedTerminalSource::Shell)),
+            (REMOTE_TMUX_TERMINAL_KIND, Some(session_name)) => {
+                Ok(Some(SerializedTerminalSource::RemoteTmux(session_name)))
+            }
+            (REMOTE_TMUX_TERMINAL_KIND, None) => {
+                anyhow::bail!("remote tmux terminal is missing its session name")
+            }
+            (unknown, _) => anyhow::bail!("unknown terminal kind {unknown:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn terminal_db(test_name: &'static str) -> TerminalDb {
+        let db = TerminalDb(db::open_test_db::<db::AppMigrator>(test_name).await);
+        db.write(|conn| {
+            Statement::prepare(conn, "INSERT INTO workspaces(workspace_id) VALUES (1)")?.exec()
+        })
+        .await
+        .expect("create test workspace");
+        db
+    }
+
+    #[gpui::test]
+    async fn terminal_source_round_trips_and_defaults_to_shell() {
+        let db = terminal_db("terminal_source_round_trips_and_defaults_to_shell").await;
+        let workspace_id = WorkspaceId::from_i64(1);
+
+        db.save_custom_title(1, workspace_id, None)
+            .await
+            .expect("create legacy-style terminal row");
+        assert_eq!(
+            db.get_terminal_source(1, workspace_id).unwrap(),
+            Some(SerializedTerminalSource::Shell)
+        );
+
+        db.save_terminal_source(1, workspace_id, Some("api worker".to_string()))
+            .await
+            .expect("save remote tmux source");
+        assert_eq!(
+            db.get_terminal_source(1, workspace_id).unwrap(),
+            Some(SerializedTerminalSource::RemoteTmux(
+                "api worker".to_string()
+            ))
+        );
+
+        db.save_terminal_source(1, workspace_id, None)
+            .await
+            .expect("restore shell source");
+        assert_eq!(
+            db.get_terminal_source(1, workspace_id).unwrap(),
+            Some(SerializedTerminalSource::Shell)
+        );
+    }
+
+    #[gpui::test]
+    async fn invalid_remote_tmux_source_never_becomes_a_shell() {
+        let db = terminal_db("invalid_remote_tmux_source_never_becomes_a_shell").await;
+        let workspace_id = WorkspaceId::from_i64(1);
+        db.save_custom_title(1, workspace_id, None)
+            .await
+            .expect("create terminal row");
+        db.write(|conn| {
+            Statement::prepare(
+                conn,
+                "UPDATE terminals SET terminal_kind = 'remote_tmux', \
+                 remote_tmux_session_name = NULL WHERE workspace_id = 1 AND item_id = 1",
+            )?
+            .exec()
+        })
+        .await
+        .expect("corrupt terminal source");
+
+        assert!(db.get_terminal_source(1, workspace_id).is_err());
     }
 }

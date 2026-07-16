@@ -1,7 +1,7 @@
 use std::{cmp, path::PathBuf, process::ExitStatus, sync::Arc, time::Duration};
 
 use crate::{
-    TerminalView, default_working_directory,
+    TerminalSource, TerminalView, default_working_directory,
     persistence::{
         SerializedItems, SerializedTerminalPanel, deserialize_terminal_panel, serialize_pane_group,
     },
@@ -16,7 +16,7 @@ use gpui::{
     Window, actions,
 };
 use itertools::Itertools;
-use project::{Fs, Project};
+use project::{Fs, Project, terminals::RemoteTmuxSession};
 
 use settings::{Settings, TerminalDockPosition};
 use task::{RevealStrategy, RevealTarget, Shell, ShellBuilder, SpawnInTerminal, TaskId};
@@ -48,7 +48,9 @@ actions!(
         /// Toggles the terminal panel.
         Toggle,
         /// Toggles focus on the terminal panel.
-        ToggleFocus
+        ToggleFocus,
+        /// Attaches an existing tmux session in the current SSH remote project.
+        AttachRemoteTmuxSession
     ]
 );
 
@@ -448,6 +450,11 @@ impl TerminalPanel {
         } else {
             None
         };
+        let source = terminal_view
+            .as_ref()
+            .map(|terminal_view| terminal_view.read(cx).source().clone())
+            .unwrap_or_default();
+        let source_for_spawn = source.clone();
         let working_directory = if clone {
             terminal_view
                 .as_ref()
@@ -470,13 +477,18 @@ impl TerminalPanel {
         };
         cx.spawn_in(window, async move |panel, cx| {
             let terminal = project
-                .update(cx, |project, cx| match terminal_view {
-                    Some(view) => project.clone_terminal(
-                        &view.read(cx).terminal.clone(),
-                        cx,
-                        working_directory,
-                    ),
-                    None => project.create_terminal_shell(working_directory, cx),
+                .update(cx, |project, cx| match source_for_spawn {
+                    TerminalSource::Shell => match terminal_view {
+                        Some(view) => project.clone_terminal(
+                            &view.read(cx).terminal.clone(),
+                            cx,
+                            working_directory,
+                        ),
+                        None => project.create_terminal_shell(working_directory, cx),
+                    },
+                    TerminalSource::RemoteTmux { session } => {
+                        project.create_remote_tmux_terminal(session, cx)
+                    }
                 })
                 .await
                 .log_err()?;
@@ -484,11 +496,12 @@ impl TerminalPanel {
             panel
                 .update_in(cx, move |terminal_panel, window, cx| {
                     let terminal_view = Box::new(cx.new(|cx| {
-                        TerminalView::new(
+                        TerminalView::new_with_source(
                             terminal.clone(),
                             weak_workspace.clone(),
                             database_id,
                             project.downgrade(),
+                            source,
                             window,
                             cx,
                         )
@@ -839,6 +852,66 @@ impl TerminalPanel {
         cx: &mut Context<Self>,
     ) -> Task<Result<WeakEntity<Terminal>>> {
         self.add_terminal_shell_internal(false, cwd, reveal_strategy, window, cx)
+    }
+
+    pub(crate) fn add_remote_tmux_terminal(
+        &mut self,
+        session: RemoteTmuxSession,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<WeakEntity<Terminal>>> {
+        let workspace = self.workspace.clone();
+        cx.spawn_in(window, async move |terminal_panel, cx| {
+            let pane = terminal_panel.update(cx, |terminal_panel, _| {
+                terminal_panel.pending_terminals_to_add += 1;
+                terminal_panel.active_pane.clone()
+            })?;
+            let project = workspace.read_with(cx, |workspace, _| workspace.project().clone())?;
+            let terminal = project
+                .update(cx, |project, cx| {
+                    project.create_remote_tmux_terminal(session.clone(), cx)
+                })
+                .await;
+
+            let result = match terminal {
+                Ok(terminal) => workspace.update_in(cx, |workspace, window, cx| {
+                    let terminal_view = Box::new(cx.new(|cx| {
+                        TerminalView::new_with_source(
+                            terminal.clone(),
+                            workspace.weak_handle(),
+                            workspace.database_id(),
+                            workspace.project().downgrade(),
+                            TerminalSource::RemoteTmux { session },
+                            window,
+                            cx,
+                        )
+                    }));
+                    workspace.focus_panel::<Self>(window, cx);
+                    pane.update(cx, |pane, cx| {
+                        pane.add_item(terminal_view, true, true, None, window, cx);
+                    });
+                    Ok(terminal.downgrade())
+                })?,
+                Err(error) => {
+                    pane.update_in(cx, |pane, window, cx| {
+                        let focus = pane.has_focus(window, cx);
+                        let failed_to_spawn = cx.new(|cx| FailedToSpawnTerminal {
+                            error: error.to_string(),
+                            focus_handle: cx.focus_handle(),
+                        });
+                        pane.add_item(Box::new(failed_to_spawn), true, focus, None, window, cx);
+                    })?;
+                    Err(error)
+                }
+            };
+
+            terminal_panel.update(cx, |terminal_panel, cx| {
+                terminal_panel.pending_terminals_to_add =
+                    terminal_panel.pending_terminals_to_add.saturating_sub(1);
+                terminal_panel.serialize(cx);
+            })?;
+            result
+        })
     }
 
     fn add_local_terminal_shell(

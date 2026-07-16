@@ -1,4 +1,5 @@
 mod persistence;
+mod remote_tmux;
 pub mod terminal_element;
 pub mod terminal_panel;
 mod terminal_path_like_target;
@@ -15,8 +16,8 @@ use gpui::{
     WeakEntity, actions, anchored, deferred, div,
 };
 use menu;
-use persistence::TerminalDb;
-use project::{Project, ProjectEntryId, search::SearchQuery};
+use persistence::{SerializedTerminalSource, TerminalDb};
+use project::{Project, ProjectEntryId, search::SearchQuery, terminals::RemoteTmuxSession};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use settings::{
@@ -106,6 +107,7 @@ pub struct RenameTerminal;
 
 pub fn init(cx: &mut App) {
     terminal_panel::init(cx);
+    remote_tmux::init(cx);
 
     register_serializable_item::<TerminalView>(cx);
 
@@ -137,6 +139,7 @@ pub struct TerminalView {
     context_menu: Option<(Entity<ContextMenu>, GpuiPoint<Pixels>, Subscription)>,
     cursor_shape: CursorShape,
     blink_manager: Entity<BlinkManager>,
+    source: TerminalSource,
     mode: TerminalMode,
     // Explicit override for whether workspace-specific context menu actions are shown.
     // When `None`, visibility is derived from `mode` (hidden for embedded terminals).
@@ -157,6 +160,31 @@ pub struct TerminalView {
     rename_editor_subscription: Option<Subscription>,
     _subscriptions: Vec<Subscription>,
     _terminal_subscriptions: Vec<Subscription>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) enum TerminalSource {
+    #[default]
+    Shell,
+    RemoteTmux {
+        session: RemoteTmuxSession,
+    },
+}
+
+impl TerminalSource {
+    fn default_title(&self) -> Option<String> {
+        match self {
+            Self::Shell => None,
+            Self::RemoteTmux { session } => Some(format!("tmux: {}", session.name())),
+        }
+    }
+
+    fn remote_tmux_session_name(&self) -> Option<String> {
+        match self {
+            Self::Shell => None,
+            Self::RemoteTmux { session } => Some(session.name().to_string()),
+        }
+    }
 }
 
 #[derive(Default, Clone)]
@@ -238,6 +266,26 @@ impl TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::new_with_source(
+            terminal,
+            workspace,
+            workspace_id,
+            project,
+            TerminalSource::Shell,
+            window,
+            cx,
+        )
+    }
+
+    pub(crate) fn new_with_source(
+        terminal: Entity<Terminal>,
+        workspace: WeakEntity<Workspace>,
+        workspace_id: Option<WorkspaceId>,
+        project: WeakEntity<Project>,
+        source: TerminalSource,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let workspace_handle = workspace.clone();
         let terminal_subscriptions =
             subscribe_for_terminal_events(&terminal, workspace, window, cx);
@@ -286,6 +334,8 @@ impl TerminalView {
             context_menu: None,
             cursor_shape,
             blink_manager,
+            needs_serialize: matches!(source, TerminalSource::RemoteTmux { .. }),
+            source,
             blinking_terminal_enabled: false,
             hover: None,
             hover_tooltip_update: Task::ready(()),
@@ -296,7 +346,6 @@ impl TerminalView {
             block_below_cursor: None,
             scroll_top: Pixels::ZERO,
             scroll_handle,
-            needs_serialize: false,
             custom_title: None,
             ime_state: None,
             self_handle: cx.entity().downgrade(),
@@ -305,6 +354,10 @@ impl TerminalView {
             _subscriptions: subscriptions,
             _terminal_subscriptions: terminal_subscriptions,
         }
+    }
+
+    pub(crate) fn source(&self) -> &TerminalSource {
+        &self.source
     }
 
     /// Enable 'embedded' mode where the terminal displays the full content with an optional limit of lines.
@@ -1462,6 +1515,7 @@ impl Item for TerminalView {
             .as_ref()
             .filter(|title| !title.trim().is_empty())
             .cloned()
+            .or_else(|| self.source.default_title())
             .unwrap_or_else(|| terminal.title(true));
 
         let (icon, icon_color, rerun_button) = match terminal.task() {
@@ -1561,6 +1615,9 @@ impl Item for TerminalView {
     fn tab_content_text(&self, detail: usize, cx: &App) -> SharedString {
         if let Some(custom_title) = self.custom_title.as_ref().filter(|l| !l.trim().is_empty()) {
             return custom_title.clone().into();
+        }
+        if let Some(title) = self.source.default_title() {
+            return title.into();
         }
         let terminal = self.terminal().read(cx);
         terminal.title(detail == 0).into()
@@ -1745,23 +1802,34 @@ impl Item for TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Option<Entity<Self>>> {
-        let Ok(terminal) = self.project.update(cx, |project, cx| {
-            let cwd = project
-                .active_project_directory(cx)
-                .map(|it| it.to_path_buf());
-            project.clone_terminal(self.terminal(), cx, cwd)
-        }) else {
+        let source = self.source.clone();
+        let source_for_spawn = source.clone();
+        let Ok(terminal) = self
+            .project
+            .update(cx, |project, cx| match source_for_spawn {
+                TerminalSource::Shell => {
+                    let cwd = project
+                        .active_project_directory(cx)
+                        .map(|it| it.to_path_buf());
+                    project.clone_terminal(self.terminal(), cx, cwd)
+                }
+                TerminalSource::RemoteTmux { session } => {
+                    project.create_remote_tmux_terminal(session, cx)
+                }
+            })
+        else {
             return Task::ready(None);
         };
         cx.spawn_in(window, async move |this, cx| {
             let terminal = terminal.await.log_err()?;
             this.update_in(cx, |this, window, cx| {
                 cx.new(|cx| {
-                    TerminalView::new(
+                    TerminalView::new_with_source(
                         terminal,
                         this.workspace.clone(),
                         workspace_id,
                         this.project.clone(),
+                        source,
                         window,
                         cx,
                     )
@@ -1874,10 +1942,13 @@ impl SerializableItem for TerminalView {
         let workspace_id = self.workspace_id?;
         let cwd = terminal.working_directory();
         let custom_title = self.custom_title.clone();
+        let remote_tmux_session_name = self.source.remote_tmux_session_name();
         self.needs_serialize = false;
 
         let db = TerminalDb::global(cx);
         Some(cx.background_spawn(async move {
+            db.save_terminal_source(item_id, workspace_id, remote_tmux_session_name)
+                .await?;
             if let Some(cwd) = cwd {
                 db.save_working_directory(item_id, workspace_id, cwd)
                     .await?;
@@ -1901,8 +1972,8 @@ impl SerializableItem for TerminalView {
         cx: &mut App,
     ) -> Task<anyhow::Result<Entity<Self>>> {
         window.spawn(cx, async move |cx| {
-            let (cwd, custom_title) = cx
-                .update(|_window, cx| {
+            let (cwd, custom_title, source) = cx.update(|_window, cx| {
+                anyhow::Ok({
                     let db = TerminalDb::global(cx);
                     let from_db = db
                         .get_working_directory(item_id, workspace_id)
@@ -1923,21 +1994,43 @@ impl SerializableItem for TerminalView {
                         .log_err()
                         .flatten()
                         .filter(|title| !title.trim().is_empty());
-                    (cwd, custom_title)
+                    let source = match db
+                        .get_terminal_source(item_id, workspace_id)?
+                        .unwrap_or(SerializedTerminalSource::Shell)
+                    {
+                        SerializedTerminalSource::Shell => TerminalSource::Shell,
+                        SerializedTerminalSource::RemoteTmux(session_name) => {
+                            TerminalSource::RemoteTmux {
+                                session: RemoteTmuxSession::new(session_name)?,
+                            }
+                        }
+                    };
+                    (cwd, custom_title, source)
                 })
-                .ok()
-                .unwrap_or((None, None));
+            })??;
 
-            let terminal = project
-                .update(cx, |project, cx| project.create_terminal_shell(cwd, cx))
-                .await?;
+            let terminal = match &source {
+                TerminalSource::Shell => {
+                    project
+                        .update(cx, |project, cx| project.create_terminal_shell(cwd, cx))
+                        .await?
+                }
+                TerminalSource::RemoteTmux { session } => {
+                    project
+                        .update(cx, |project, cx| {
+                            project.create_remote_tmux_terminal(session.clone(), cx)
+                        })
+                        .await?
+                }
+            };
             cx.update(|window, cx| {
                 cx.new(|cx| {
-                    let mut view = TerminalView::new(
+                    let mut view = TerminalView::new_with_source(
                         terminal,
                         workspace,
                         Some(workspace_id),
                         project.downgrade(),
+                        source,
                         window,
                         cx,
                     );
@@ -2170,6 +2263,22 @@ mod tests {
     use std::path::{Path, PathBuf};
     use util::paths::PathStyle;
     use util::rel_path::RelPath;
+
+    #[test]
+    fn remote_tmux_source_keeps_exact_session_identity() {
+        let source = TerminalSource::RemoteTmux {
+            session: RemoteTmuxSession::new(" api worker ".to_string()).unwrap(),
+        };
+
+        assert_eq!(
+            source.default_title().as_deref(),
+            Some("tmux:  api worker ")
+        );
+        assert_eq!(
+            source.remote_tmux_session_name().as_deref(),
+            Some(" api worker ")
+        );
+    }
     use workspace::item::test::{TestItem, TestProjectItem};
     use workspace::{AppState, MultiWorkspace, SelectedEntry};
 
