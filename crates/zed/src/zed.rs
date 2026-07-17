@@ -1202,6 +1202,10 @@ fn register_actions(
             }
         })
         .register_action(|_, _: &install_cli::RegisterZedScheme, window, cx| {
+            if release_channel::is_zed_tmux_build() {
+                return;
+            }
+
             cx.spawn_in(window, async move |workspace, cx| {
                 install_cli::register_zed_scheme(cx).await?;
                 workspace.update_in(cx, |workspace, _, cx| {
@@ -1471,6 +1475,9 @@ fn initialize_pane(
 fn open_about_window(cx: &mut App) {
     fn about_window_icon(release_channel: ReleaseChannel) -> Arc<Image> {
         let bytes = match release_channel {
+            ReleaseChannel::Dev if release_channel::is_zed_tmux_build() => {
+                include_bytes!("../resources/app-icon-tmux.png").as_slice()
+            }
             ReleaseChannel::Dev => include_bytes!("../resources/app-icon-dev.png").as_slice(),
             ReleaseChannel::Nightly => {
                 include_bytes!("../resources/app-icon-nightly.png").as_slice()
@@ -1656,11 +1663,12 @@ fn open_about_window(cx: &mut App) {
         width: px(440.),
         height: px(300.),
     };
+    let display_name = ReleaseChannel::global(cx).display_name();
 
     cx.open_window(
         WindowOptions {
             titlebar: Some(TitlebarOptions {
-                title: Some("About Zed".into()),
+                title: Some(format!("About {display_name}").into()),
                 appears_transparent: true,
                 traffic_light_position: Some(point(px(12.), px(12.))),
             }),

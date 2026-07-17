@@ -16,8 +16,8 @@ use gpui::{
     WeakEntity, actions, anchored, deferred, div,
 };
 use menu;
-use persistence::{SerializedTerminalSource, TerminalDb};
-use project::{Project, ProjectEntryId, search::SearchQuery, terminals::RemoteTmuxSession};
+use persistence::{SerializedTerminalSource, TerminalDb, delete_unloaded_terminals};
+use project::{Project, ProjectEntryId, search::SearchQuery, terminals::TmuxSession};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use settings::{
@@ -50,8 +50,8 @@ use ui::{
 };
 use util::ResultExt;
 use workspace::{
-    CloseActiveItem, DraggedSelection, DraggedTab, NewCenterTerminal, NewTerminal, Pane,
-    ToolbarItemLocation, Workspace, WorkspaceId, delete_unloaded_items,
+    CloseActiveItem, DraggedSelection, DraggedTab, ItemId, NewCenterTerminal, NewTerminal, Pane,
+    ToolbarItemLocation, Workspace, WorkspaceId,
     item::{
         HighlightedText, Item, ItemEvent, SerializableItem, TabContentParams, TabTooltipContent,
     },
@@ -146,6 +146,7 @@ pub struct TerminalView {
     show_workspace_actions: Option<bool>,
     blinking_terminal_enabled: bool,
     needs_serialize: bool,
+    serialized_item_id: ItemId,
     custom_title: Option<String>,
     hover: Option<HoverTarget>,
     hover_tooltip_update: Task<()>,
@@ -166,8 +167,8 @@ pub struct TerminalView {
 pub(crate) enum TerminalSource {
     #[default]
     Shell,
-    RemoteTmux {
-        session: RemoteTmuxSession,
+    Tmux {
+        session: TmuxSession,
     },
 }
 
@@ -175,14 +176,14 @@ impl TerminalSource {
     fn default_title(&self) -> Option<String> {
         match self {
             Self::Shell => None,
-            Self::RemoteTmux { session } => Some(format!("tmux: {}", session.name())),
+            Self::Tmux { session } => Some(session.name().to_string()),
         }
     }
 
-    fn remote_tmux_session_name(&self) -> Option<String> {
+    fn tmux_session_name(&self) -> Option<String> {
         match self {
             Self::Shell => None,
-            Self::RemoteTmux { session } => Some(session.name().to_string()),
+            Self::Tmux { session } => Some(session.name().to_string()),
         }
     }
 }
@@ -286,6 +287,32 @@ impl TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::new_with_source_and_serialized_item_id(
+            terminal,
+            workspace,
+            workspace_id,
+            project,
+            source,
+            None,
+            window,
+            cx,
+        )
+    }
+
+    fn new_with_source_and_serialized_item_id(
+        terminal: Entity<Terminal>,
+        workspace: WeakEntity<Workspace>,
+        workspace_id: Option<WorkspaceId>,
+        project: WeakEntity<Project>,
+        source: TerminalSource,
+        serialized_item_id: Option<ItemId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let serialized_item_id = serialized_item_id.unwrap_or_else(|| {
+            let item_id = uuid::Uuid::new_v4().as_u128() as u64 & i64::MAX as u64;
+            item_id.max(1)
+        });
         let workspace_handle = workspace.clone();
         let terminal_subscriptions =
             subscribe_for_terminal_events(&terminal, workspace, window, cx);
@@ -334,9 +361,10 @@ impl TerminalView {
             context_menu: None,
             cursor_shape,
             blink_manager,
-            needs_serialize: matches!(source, TerminalSource::RemoteTmux { .. }),
+            needs_serialize: matches!(source, TerminalSource::Tmux { .. }),
             source,
             blinking_terminal_enabled: false,
+            serialized_item_id,
             hover: None,
             hover_tooltip_update: Task::ready(()),
             mode: TerminalMode::Standalone,
@@ -358,6 +386,109 @@ impl TerminalView {
 
     pub(crate) fn source(&self) -> &TerminalSource {
         &self.source
+    }
+
+    pub(crate) fn serialized_item_id(&self) -> ItemId {
+        self.serialized_item_id
+    }
+
+    pub(crate) fn deserialize_for_terminal_panel(
+        project: Entity<Project>,
+        workspace: WeakEntity<Workspace>,
+        workspace_id: WorkspaceId,
+        item_id: ItemId,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<anyhow::Result<Entity<Self>>> {
+        Self::deserialize_with_serialized_item_id(
+            project,
+            workspace,
+            workspace_id,
+            item_id,
+            Some(item_id),
+            window,
+            cx,
+        )
+    }
+
+    fn deserialize_with_serialized_item_id(
+        project: Entity<Project>,
+        workspace: WeakEntity<Workspace>,
+        workspace_id: WorkspaceId,
+        item_id: ItemId,
+        serialized_item_id: Option<ItemId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<anyhow::Result<Entity<Self>>> {
+        window.spawn(cx, async move |cx| {
+            let (cwd, custom_title, source) = cx.update(|_window, cx| {
+                anyhow::Ok({
+                    let db = TerminalDb::global(cx);
+                    let from_db = db
+                        .get_working_directory(item_id, workspace_id)
+                        .log_err()
+                        .flatten();
+                    let cwd = if from_db
+                        .as_ref()
+                        .is_some_and(|from_db| !from_db.as_os_str().is_empty())
+                    {
+                        from_db
+                    } else {
+                        workspace
+                            .upgrade()
+                            .and_then(|workspace| default_working_directory(workspace.read(cx), cx))
+                    };
+                    let custom_title = db
+                        .get_custom_title(item_id, workspace_id)
+                        .log_err()
+                        .flatten()
+                        .filter(|title| !title.trim().is_empty());
+                    let source = match db
+                        .get_terminal_source(item_id, workspace_id)?
+                        .unwrap_or(SerializedTerminalSource::Shell)
+                    {
+                        SerializedTerminalSource::Shell => TerminalSource::Shell,
+                        SerializedTerminalSource::Tmux(session_name) => TerminalSource::Tmux {
+                            session: TmuxSession::new(session_name)?,
+                        },
+                    };
+                    (cwd, custom_title, source)
+                })
+            })??;
+
+            let terminal = match &source {
+                TerminalSource::Shell => {
+                    project
+                        .update(cx, |project, cx| project.create_terminal_shell(cwd, cx))
+                        .await?
+                }
+                TerminalSource::Tmux { session } => {
+                    project
+                        .update(cx, |project, cx| {
+                            project.create_tmux_terminal(session.clone(), cx)
+                        })
+                        .await?
+                }
+            };
+            cx.update(|window, cx| {
+                cx.new(|cx| {
+                    let mut view = TerminalView::new_with_source_and_serialized_item_id(
+                        terminal,
+                        workspace,
+                        Some(workspace_id),
+                        project.downgrade(),
+                        source,
+                        serialized_item_id,
+                        window,
+                        cx,
+                    );
+                    if custom_title.is_some() {
+                        view.custom_title = custom_title;
+                    }
+                    view
+                })
+            })
+        })
     }
 
     /// Enable 'embedded' mode where the terminal displays the full content with an optional limit of lines.
@@ -1813,9 +1944,7 @@ impl Item for TerminalView {
                         .map(|it| it.to_path_buf());
                     project.clone_terminal(self.terminal(), cx, cwd)
                 }
-                TerminalSource::RemoteTmux { session } => {
-                    project.create_remote_tmux_terminal(session, cx)
-                }
+                TerminalSource::Tmux { session } => project.create_tmux_terminal(session, cx),
             })
         else {
             return Task::ready(None);
@@ -1892,9 +2021,10 @@ impl Item for TerminalView {
                     "Updating workspace id for the terminal, old: {old_id:?}, new: {new_id:?}",
                 );
                 let db = TerminalDb::global(cx);
-                let entity_id = cx.entity_id().as_u64();
+                let serialized_item_id = self.serialized_item_id;
                 cx.background_spawn(async move {
-                    db.update_workspace_id(new_id, old_id, entity_id).await
+                    db.update_workspace_id(new_id, old_id, serialized_item_id)
+                        .await
                 })
                 .detach();
             }
@@ -1912,6 +2042,10 @@ impl SerializableItem for TerminalView {
         "Terminal"
     }
 
+    fn serialized_item_id(&self, _entity_id: gpui::EntityId) -> ItemId {
+        self.serialized_item_id
+    }
+
     fn cleanup(
         workspace_id: WorkspaceId,
         alive_items: Vec<workspace::ItemId>,
@@ -1919,7 +2053,7 @@ impl SerializableItem for TerminalView {
         cx: &mut App,
     ) -> Task<anyhow::Result<()>> {
         let db = TerminalDb::global(cx);
-        delete_unloaded_items(alive_items, workspace_id, "terminals", &db, cx)
+        delete_unloaded_terminals(alive_items, workspace_id, &db, cx)
     }
 
     fn serialize(
@@ -1942,12 +2076,12 @@ impl SerializableItem for TerminalView {
         let workspace_id = self.workspace_id?;
         let cwd = terminal.working_directory();
         let custom_title = self.custom_title.clone();
-        let remote_tmux_session_name = self.source.remote_tmux_session_name();
+        let tmux_session_name = self.source.tmux_session_name();
         self.needs_serialize = false;
 
         let db = TerminalDb::global(cx);
         Some(cx.background_spawn(async move {
-            db.save_terminal_source(item_id, workspace_id, remote_tmux_session_name)
+            db.save_terminal_source(item_id, workspace_id, tmux_session_name)
                 .await?;
             if let Some(cwd) = cwd {
                 db.save_working_directory(item_id, workspace_id, cwd)
@@ -1971,76 +2105,15 @@ impl SerializableItem for TerminalView {
         window: &mut Window,
         cx: &mut App,
     ) -> Task<anyhow::Result<Entity<Self>>> {
-        window.spawn(cx, async move |cx| {
-            let (cwd, custom_title, source) = cx.update(|_window, cx| {
-                anyhow::Ok({
-                    let db = TerminalDb::global(cx);
-                    let from_db = db
-                        .get_working_directory(item_id, workspace_id)
-                        .log_err()
-                        .flatten();
-                    let cwd = if from_db
-                        .as_ref()
-                        .is_some_and(|from_db| !from_db.as_os_str().is_empty())
-                    {
-                        from_db
-                    } else {
-                        workspace
-                            .upgrade()
-                            .and_then(|workspace| default_working_directory(workspace.read(cx), cx))
-                    };
-                    let custom_title = db
-                        .get_custom_title(item_id, workspace_id)
-                        .log_err()
-                        .flatten()
-                        .filter(|title| !title.trim().is_empty());
-                    let source = match db
-                        .get_terminal_source(item_id, workspace_id)?
-                        .unwrap_or(SerializedTerminalSource::Shell)
-                    {
-                        SerializedTerminalSource::Shell => TerminalSource::Shell,
-                        SerializedTerminalSource::RemoteTmux(session_name) => {
-                            TerminalSource::RemoteTmux {
-                                session: RemoteTmuxSession::new(session_name)?,
-                            }
-                        }
-                    };
-                    (cwd, custom_title, source)
-                })
-            })??;
-
-            let terminal = match &source {
-                TerminalSource::Shell => {
-                    project
-                        .update(cx, |project, cx| project.create_terminal_shell(cwd, cx))
-                        .await?
-                }
-                TerminalSource::RemoteTmux { session } => {
-                    project
-                        .update(cx, |project, cx| {
-                            project.create_remote_tmux_terminal(session.clone(), cx)
-                        })
-                        .await?
-                }
-            };
-            cx.update(|window, cx| {
-                cx.new(|cx| {
-                    let mut view = TerminalView::new_with_source(
-                        terminal,
-                        workspace,
-                        Some(workspace_id),
-                        project.downgrade(),
-                        source,
-                        window,
-                        cx,
-                    );
-                    if custom_title.is_some() {
-                        view.custom_title = custom_title;
-                    }
-                    view
-                })
-            })
-        })
+        Self::deserialize_with_serialized_item_id(
+            project,
+            workspace,
+            workspace_id,
+            item_id,
+            Some(item_id),
+            window,
+            cx,
+        )
     }
 }
 
@@ -2265,19 +2338,13 @@ mod tests {
     use util::rel_path::RelPath;
 
     #[test]
-    fn remote_tmux_source_keeps_exact_session_identity() {
-        let source = TerminalSource::RemoteTmux {
-            session: RemoteTmuxSession::new(" api worker ".to_string()).unwrap(),
+    fn tmux_source_keeps_exact_session_identity() {
+        let source = TerminalSource::Tmux {
+            session: TmuxSession::new(" api worker ".to_string()).unwrap(),
         };
 
-        assert_eq!(
-            source.default_title().as_deref(),
-            Some("tmux:  api worker ")
-        );
-        assert_eq!(
-            source.remote_tmux_session_name().as_deref(),
-            Some(" api worker ")
-        );
+        assert_eq!(source.default_title().as_deref(), Some(" api worker "));
+        assert_eq!(source.tmux_session_name().as_deref(), Some(" api worker "));
     }
     use workspace::item::test::{TestItem, TestProjectItem};
     use workspace::{AppState, MultiWorkspace, SelectedEntry};
@@ -2682,6 +2749,49 @@ mod tests {
                 (active_pane, terminal, terminal_view)
             })
             .unwrap()
+    }
+
+    #[gpui::test]
+    async fn terminal_panel_item_id_survives_two_view_recreations(cx: &mut TestAppContext) {
+        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
+        let serialized_item_id = 4242;
+        let mut previous_entity_id = None;
+
+        for iteration in 0..3 {
+            let (pane, _terminal, terminal_view) =
+                add_display_only_terminal(&project, window_handle, true, cx);
+            let entity_id = terminal_view.entity_id();
+            assert_ne!(Some(entity_id), previous_entity_id);
+
+            terminal_view.update(cx, |terminal_view, _| {
+                terminal_view.source = TerminalSource::Tmux {
+                    session: TmuxSession::new("master".to_string()).expect("valid tmux session"),
+                };
+                terminal_view.serialized_item_id = serialized_item_id;
+            });
+
+            cx.update(|cx| {
+                let pane_group = workspace::PaneGroup::new(pane.clone());
+                let persistence::SerializedPaneGroup::Pane(serialized_pane) =
+                    persistence::serialize_pane_group(&pane_group, &pane, cx)
+                else {
+                    panic!("single pane should serialize as a pane");
+                };
+                assert_eq!(serialized_pane.children, vec![serialized_item_id]);
+                assert_eq!(serialized_pane.active_item, Some(serialized_item_id));
+            });
+
+            previous_entity_id = Some(entity_id);
+            if iteration < 2 {
+                window_handle
+                    .update(cx, |_, window, cx| {
+                        pane.update(cx, |pane, cx| {
+                            pane.remove_item(entity_id, false, false, window, cx)
+                        });
+                    })
+                    .expect("window should remain open");
+            }
+        }
     }
 
     /// Creates a worktree with 1 file /root.txt and returns the project, workspace, and window handle.

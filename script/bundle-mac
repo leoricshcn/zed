@@ -24,6 +24,10 @@ Options:
   -o    Open dir with the resulting DMG or launch the app itself in local mode.
   -i    Install the resulting DMG into /Applications.
   -h    Display this help and exit.
+
+Environment:
+  ZED_BUNDLED_REMOTE_SERVER_PATH
+        Reuse a gzip-compressed Linux x86-64 remote server for Zed Tmux builds.
   "
 }
 
@@ -54,6 +58,17 @@ channel=$(<RELEASE_CHANNEL)
 export ZED_RELEASE_CHANNEL="${channel}"
 popd
 
+zed_build_features=""
+zed_app_data_name=""
+zed_app_variant=""
+dmg_product_name="Zed"
+if [[ "${channel}" = "dev" ]]; then
+    zed_build_features="--features zed/build-remote-server-binary"
+    zed_app_data_name="Zed Tmux"
+    zed_app_variant="tmux"
+    dmg_product_name="Zed-Tmux"
+fi
+
 export ZED_BUNDLE=true
 
 cargo_bundle_version=$(cargo -q bundle --help 2>&1 | head -n 1 || echo "")
@@ -81,16 +96,75 @@ else
     exit 1
 fi
 
+bundled_remote_server_path=""
+reuse_bundled_remote_server=false
+if [[ "${ZED_BUNDLED_REMOTE_SERVER_PATH+x}" = "x" ]]; then
+    if [[ -z "${zed_app_variant}" ]]; then
+        echo "ZED_BUNDLED_REMOTE_SERVER_PATH can only be used for Zed Tmux builds."
+        exit 1
+    fi
+
+    bundled_remote_server_path="${ZED_BUNDLED_REMOTE_SERVER_PATH}"
+    if [[ ! -f "${bundled_remote_server_path}" ]]; then
+        echo "Bundled remote server does not exist: ${bundled_remote_server_path}"
+        exit 1
+    fi
+    if ! gzip --test "${bundled_remote_server_path}"; then
+        echo "Bundled remote server is not a valid gzip file: ${bundled_remote_server_path}"
+        exit 1
+    fi
+
+    remote_server_file_type=$(gzip --decompress --stdout "${bundled_remote_server_path}" | file -)
+    if [[ "${remote_server_file_type}" != *"ELF 64-bit"* || "${remote_server_file_type}" != *"x86-64"* ]]; then
+        echo "Bundled remote server is not a Linux x86-64 ELF binary: ${bundled_remote_server_path}"
+        echo "file reported: ${remote_server_file_type}"
+        exit 1
+    fi
+
+    echo "Reusing bundled Linux x86-64 remote server: ${bundled_remote_server_path}"
+    reuse_bundled_remote_server=true
+fi
+
 # Generate the licenses first, so they can be baked into the binaries
 script/generate-licenses
 
 rustup target add $target_triple
 
 echo "Compiling zed binaries"
-cargo build ${build_flag} --package zed --package cli --target $target_triple
-# Build remote_server in separate invocation to prevent feature unification from other crates
-# from influencing dynamic libraries required by it.
-cargo build ${build_flag} --package remote_server --target $target_triple
+if [[ -n "${zed_app_data_name}" ]]; then
+    export ZED_MACOS_APP_DATA_NAME="${zed_app_data_name}"
+    export ZED_MACOS_APP_VARIANT="${zed_app_variant}"
+fi
+cargo build ${build_flag} ${zed_build_features} --package zed --package cli --target $target_triple
+unset ZED_MACOS_APP_DATA_NAME ZED_MACOS_APP_VARIANT
+
+if [[ -n "${zed_app_variant}" ]]; then
+    if [[ "${reuse_bundled_remote_server}" = false ]]; then
+        remote_server_target="x86_64-unknown-linux-musl"
+        remote_server_binary="target/remote_server/${remote_server_target}/release/remote_server"
+        bundled_remote_server_path="target/remote_server/zed-remote-server-linux-x86_64.gz"
+
+        echo "Compiling bundled Linux x86_64 remote server"
+        rustup target add "${remote_server_target}"
+        (
+            ulimit -n 4096
+            RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=+crt-static" \
+                CARGO_PROFILE_RELEASE_DEBUG=0 \
+                CARGO_PROFILE_RELEASE_STRIP=symbols \
+                cargo zigbuild \
+                --release \
+                --package remote_server \
+                --features debug-embed \
+                --target-dir target/remote_server \
+                --target "${remote_server_target}"
+        )
+        gzip --stdout --best "${remote_server_binary}" > "${bundled_remote_server_path}"
+    fi
+else
+    # Build remote_server in separate invocation to prevent feature unification from other crates
+    # from influencing dynamic libraries required by it.
+    cargo build ${build_flag} --package remote_server --target $target_triple
+fi
 
 echo "Creating application bundle"
 pushd crates/zed
@@ -100,11 +174,23 @@ sed \
     "s/package.metadata.bundle-${channel}/package.metadata.bundle/" \
     Cargo.toml
 
-app_path=$(cargo bundle ${build_flag} --target $target_triple --select-workspace-root | xargs)
+if [[ -n "${zed_app_data_name}" ]]; then
+    export ZED_MACOS_APP_DATA_NAME="${zed_app_data_name}"
+    export ZED_MACOS_APP_VARIANT="${zed_app_variant}"
+fi
+app_path=$(cargo bundle ${build_flag} ${zed_build_features} --target $target_triple --select-workspace-root | xargs)
+unset ZED_MACOS_APP_DATA_NAME ZED_MACOS_APP_VARIANT
 
 mv Cargo.toml.backup Cargo.toml
 popd
 echo "Bundled ${app_path}"
+
+if [[ -n "${bundled_remote_server_path}" ]]; then
+    bundled_remote_server_directory="${app_path}/Contents/Resources/remote_servers"
+    mkdir -p "${bundled_remote_server_directory}"
+    cp "${bundled_remote_server_path}" \
+        "${bundled_remote_server_directory}/zed-remote-server-linux-x86_64.gz"
+fi
 
 # DocumentTypes.plist references CFBundleTypeIconFile "Document", so the bundle must contain Document.icns.
 # We use the app icon as a placeholder document icon for now.
@@ -195,8 +281,10 @@ function sign_app_binaries() {
     echo "Downloading git binary"
     download_git "${target_triple}" "${app_path}/Contents/MacOS/git"
 
-    # Note: The app identifier for our development builds is the same as the app identifier for nightly.
-    cp crates/zed/contents/$channel/embedded.provisionprofile "${app_path}/Contents/"
+    if [[ -z "${zed_app_variant}" ]]; then
+        # Note: The app identifier for our development builds is the same as the app identifier for nightly.
+        cp crates/zed/contents/$channel/embedded.provisionprofile "${app_path}/Contents/"
+    fi
 
     if [[ $can_code_sign = true ]]; then
         echo "Code signing binaries"
@@ -226,7 +314,7 @@ function sign_app_binaries() {
 
     if [ "$local_install" = true ]; then
         rm -rf "/Applications/$bundle_name"
-        mv "$app_path" "/Applications/$bundle_name"
+        ditto "$app_path" "/Applications/$bundle_name"
         echo "Installed application bundle: /Applications/$bundle_name"
         if [ "$open_result" = true ]; then
             echo "Opening /Applications/$bundle_name"
@@ -245,7 +333,7 @@ function sign_app_binaries() {
     else
         dmg_target_directory="target/${target_triple}/${target_dir}"
         dmg_source_directory="${dmg_target_directory}/dmg"
-        dmg_file_path="${dmg_target_directory}/Zed-${arch_suffix}.dmg"
+        dmg_file_path="${dmg_target_directory}/${dmg_product_name}-${arch_suffix}.dmg"
         xcode_bin_dir_path="$(xcode-select -p)/usr/bin"
 
         rm -rf ${dmg_source_directory}
@@ -257,7 +345,7 @@ function sign_app_binaries() {
         ln -s /Applications ${dmg_source_directory}
 
         echo "Creating final DMG at ${dmg_file_path} using ${dmg_source_directory}"
-        hdiutil create -volname Zed -srcfolder "${dmg_source_directory}" -ov -format UDZO "${dmg_file_path}"
+        hdiutil create -volname "${zed_app_data_name:-Zed}" -srcfolder "${dmg_source_directory}" -ov -format UDZO "${dmg_file_path}"
 
         # If someone runs this bundle script locally, a symlink will be placed in `dmg_source_directory`.
         # This symlink causes CPU issues with Zed if the Zed codebase is the project being worked on, so we simply remove it for now.
@@ -293,7 +381,9 @@ function sign_binary() {
 }
 
 function upload_debug_symbols() {
-    if [ "$local_install" = true ]; then
+    if [[ -n "${bundled_remote_server_path}" ]]; then
+        echo "Zed Tmux build; skipping sentry upload."
+    elif [ "$local_install" = true ]; then
         echo "local install; skipping sentry upload."
     elif [[ -n "${SENTRY_AUTH_TOKEN:-}" ]]; then
         echo "Uploading zed debug symbols to sentry..."
@@ -336,5 +426,7 @@ cp target/${target_triple}/${target_dir}/zed "${app_path}/Contents/MacOS/zed"
 cp target/${target_triple}/${target_dir}/cli "${app_path}/Contents/MacOS/cli"
 sign_app_binaries
 
-sign_binary "target/$target_triple/release/remote_server"
-gzip -f --stdout --best target/$target_triple/release/remote_server > target/zed-remote-server-macos-$arch_suffix.gz
+if [[ -z "${bundled_remote_server_path}" ]]; then
+    sign_binary "target/$target_triple/release/remote_server"
+    gzip -f --stdout --best target/$target_triple/release/remote_server > target/zed-remote-server-macos-$arch_suffix.gz
+fi

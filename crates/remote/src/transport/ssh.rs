@@ -14,7 +14,7 @@ use futures::{
 use gpui::{App, AppContext as _, AsyncApp, Task};
 use parking_lot::Mutex;
 use paths::remote_server_dir_relative;
-use release_channel::{AppVersion, ReleaseChannel};
+use release_channel::{AppCommitSha, AppVersion, ReleaseChannel};
 use rpc::proto::Envelope;
 use semver::Version;
 pub use settings::SshPortForwardOption;
@@ -28,6 +28,12 @@ use std::{
     },
     time::Instant,
 };
+
+#[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
+use std::sync::atomic::AtomicU64;
+
+#[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
+static NEXT_REMOTE_SERVER_UPLOAD_ID: AtomicU64 = AtomicU64::new(0);
 use tempfile::TempDir;
 use util::command::{Child, Stdio};
 use util::{
@@ -807,7 +813,15 @@ impl SshRemoteConnection {
         version: Version,
         cx: &mut AsyncApp,
     ) -> Result<Arc<RelPath>> {
+        let expected_server_version = cx.update(|cx| match release_channel {
+            ReleaseChannel::Dev => AppCommitSha::try_global(cx).map(|sha| sha.full()),
+            _ => None,
+        });
         let version_str = match release_channel {
+            ReleaseChannel::Dev if release_channel::is_zed_tmux_build() => format!(
+                "tmux-{}",
+                expected_server_version.as_deref().unwrap_or("build")
+            ),
             ReleaseChannel::Dev => "build".to_string(),
             _ => version.to_string(),
         };
@@ -833,7 +847,11 @@ impl SshRemoteConnection {
                 true,
             )
             .await
-            .is_ok();
+            .is_ok_and(|server_version| {
+                expected_server_version
+                    .as_deref()
+                    .is_none_or(|expected_version| server_version.trim() == expected_version)
+            });
 
         #[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
         if let Some(remote_server_path) = super::build_remote_server_from_source(
@@ -844,14 +862,19 @@ impl SshRemoteConnection {
         )
         .await?
         {
-            let tmp_path = paths::remote_server_dir_relative().join(
-                RelPath::from_unix_str(&format!(
-                    "download-{}-{}",
-                    std::process::id(),
-                    remote_server_path.file_name().unwrap().to_string_lossy()
-                ))
-                .unwrap(),
+            let upload_id = NEXT_REMOTE_SERVER_UPLOAD_ID.fetch_add(1, Ordering::Relaxed);
+            let remote_server_file_name = remote_server_path
+                .file_name()
+                .context("remote server path has no file name")?
+                .to_string_lossy();
+            let tmp_file_name = format!(
+                "download-{}-{}-{remote_server_file_name}",
+                std::process::id(),
+                upload_id,
             );
+            let tmp_relative_path = RelPath::from_unix_str(&tmp_file_name)
+                .context("remote server temporary path is invalid")?;
+            let tmp_path = paths::remote_server_dir_relative().join(tmp_relative_path);
             self.upload_local_server_binary(&remote_server_path, &tmp_path, delegate, cx)
                 .await?;
             self.extract_server_binary(&dst_path, &tmp_path, delegate, cx)

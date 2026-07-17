@@ -29,9 +29,9 @@ pub struct Terminals {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RemoteTmuxSession(String);
+pub struct TmuxSession(String);
 
-impl RemoteTmuxSession {
+impl TmuxSession {
     pub fn new(session_name: String) -> Result<Self> {
         anyhow::ensure!(
             !session_name.contains('\0'),
@@ -57,50 +57,93 @@ impl RemoteTmuxSession {
     }
 }
 
+fn local_tmux_shell(program: &str, args: Vec<String>) -> Shell {
+    Shell::WithArguments {
+        program: program.to_string(),
+        args,
+        title_override: None,
+    }
+}
+
 impl Project {
-    pub fn ssh_remote_display_name(&self, cx: &App) -> Option<String> {
-        let remote_client = self.remote_client.as_ref()?;
-        let RemoteConnectionOptions::Ssh(options) = remote_client.read(cx).connection_options()
-        else {
-            return None;
+    pub fn tmux_display_name(&self, cx: &App) -> Option<String> {
+        let Some(remote_client) = self.remote_client.as_ref() else {
+            return Some("this machine".to_string());
         };
-        Some(options.nickname.unwrap_or_else(|| options.host.to_string()))
+        match remote_client.read(cx).connection_options() {
+            RemoteConnectionOptions::Ssh(options) => {
+                Some(options.nickname.unwrap_or_else(|| options.host.to_string()))
+            }
+            _ => None,
+        }
     }
 
-    pub fn create_remote_tmux_terminal(
+    pub fn create_tmux_terminal(
         &mut self,
-        session: RemoteTmuxSession,
+        session: TmuxSession,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Terminal>>> {
-        let Some(remote_client) = self.remote_client.clone() else {
+        let remote_client = self.remote_client.clone();
+        if let Some(remote_client) = remote_client.as_ref()
+            && !matches!(
+                remote_client.read(cx).connection_options(),
+                RemoteConnectionOptions::Ssh(_)
+            )
+        {
             return Task::ready(Err(anyhow::anyhow!(
-                "tmux sessions can only be attached in an SSH remote project"
-            )));
-        };
-        if !matches!(
-            remote_client.read(cx).connection_options(),
-            RemoteConnectionOptions::Ssh(_)
-        ) {
-            return Task::ready(Err(anyhow::anyhow!(
-                "tmux sessions can only be attached in an SSH remote project"
+                "tmux sessions can only be attached in local or SSH remote projects"
             )));
         }
 
         let settings = TerminalSettings::get_global(cx).clone();
         let path_style = self.path_style(cx);
         let (program, args) = session.command();
+        let local_working_directory = if remote_client.is_none() {
+            self.active_project_directory(cx)
+        } else {
+            None
+        };
+        let local_environment = if remote_client.is_none() {
+            Some(self.resolve_directory_environment(
+                &get_system_shell(),
+                local_working_directory.clone(),
+                None,
+                cx,
+            ))
+        } else {
+            None
+        };
         cx.spawn(async move |project, cx| {
+            let mut local_environment = match local_environment {
+                Some(local_environment) => local_environment.await.unwrap_or_default(),
+                None => HashMap::default(),
+            };
+            if remote_client.is_none() {
+                local_environment.extend(settings.env.clone());
+            }
+
             let builder = project
                 .update(cx, move |_, cx| {
-                    let (shell, env) = create_remote_shell(
-                        Some((program, &args)),
-                        HashMap::default(),
-                        None,
-                        remote_client,
-                        cx,
-                    )?;
+                    let (working_directory, shell, env, is_remote_terminal) = match remote_client {
+                        Some(remote_client) => {
+                            let (shell, env) = create_remote_shell(
+                                Some((program, &args)),
+                                HashMap::default(),
+                                None,
+                                remote_client,
+                                cx,
+                            )?;
+                            (None, shell, env, true)
+                        }
+                        None => (
+                            local_working_directory.map(|path| path.to_path_buf()),
+                            local_tmux_shell(program, args),
+                            local_environment,
+                            false,
+                        ),
+                    };
                     anyhow::Ok(TerminalBuilder::new(
-                        None,
+                        working_directory,
                         None,
                         shell,
                         env,
@@ -109,7 +152,7 @@ impl Project {
                         settings.max_scroll_history_lines,
                         settings.path_hyperlink_regexes,
                         settings.path_hyperlink_timeout_ms,
-                        true,
+                        is_remote_terminal,
                         cx.entity_id().as_u64(),
                         None,
                         cx,
@@ -834,8 +877,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     #[test]
-    fn remote_tmux_session_builds_one_closed_command() {
-        let session = RemoteTmuxSession::new("api; $(touch /tmp/not-run) 'worker'".to_string())
+    fn tmux_session_builds_one_closed_command() {
+        let session = TmuxSession::new("api; $(touch /tmp/not-run) 'worker'".to_string())
             .expect("valid session name");
 
         assert_eq!(
@@ -853,17 +896,38 @@ mod tests {
     }
 
     #[test]
-    fn remote_tmux_session_preserves_names_and_rejects_nul() {
-        assert!(RemoteTmuxSession::new("api\0worker".to_string()).is_err());
+    fn local_tmux_shell_runs_the_exact_tmux_command() {
+        let session = TmuxSession::new("api; $(touch /tmp/not-run) 'worker'".to_string())
+            .expect("valid session name");
+        let (program, args) = session.command();
+
         assert_eq!(
-            RemoteTmuxSession::new(String::new())
+            local_tmux_shell(program, args),
+            Shell::WithArguments {
+                program: "tmux".to_string(),
+                args: vec![
+                    "-N".to_string(),
+                    "attach-session".to_string(),
+                    "-t".to_string(),
+                    "=api; $(touch /tmp/not-run) 'worker'".to_string(),
+                ],
+                title_override: None,
+            }
+        );
+    }
+
+    #[test]
+    fn tmux_session_preserves_names_and_rejects_nul() {
+        assert!(TmuxSession::new("api\0worker".to_string()).is_err());
+        assert_eq!(
+            TmuxSession::new(String::new())
                 .expect("empty names are sent to tmux unchanged")
                 .command()
                 .1,
             ["-N", "attach-session", "-t", "="]
         );
         assert_eq!(
-            RemoteTmuxSession::new(" api worker ".to_string())
+            TmuxSession::new(" api worker ".to_string())
                 .expect("spaces are preserved")
                 .name(),
             " api worker "

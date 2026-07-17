@@ -4,35 +4,69 @@ use gpui::{
     SharedString, WeakEntity, Window,
 };
 use menu::{Cancel, Confirm};
-use project::terminals::RemoteTmuxSession;
+use project::terminals::TmuxSession;
 use ui::prelude::*;
 use workspace::{
-    ModalView, Workspace,
+    ModalView, NewCenterTmux, Workspace,
     notifications::{DetachAndPromptErr, NotificationId},
 };
 
-use crate::terminal_panel::{AttachRemoteTmuxSession, TerminalPanel};
+use crate::terminal_panel::{AttachTmuxSession, TerminalPanel};
 
 pub(crate) fn init(cx: &mut App) {
     cx.observe_new(
         |workspace: &mut Workspace, _window, _: &mut Context<Workspace>| {
-            workspace.register_action(show);
+            workspace.register_action(show_in_panel);
+            workspace.register_action(show_in_center);
         },
     )
     .detach();
 }
 
-fn show(
+#[derive(Clone, Copy)]
+enum TmuxTarget {
+    Panel,
+    Center,
+}
+
+impl TmuxTarget {
+    fn notification_id(self) -> NotificationId {
+        match self {
+            Self::Panel => NotificationId::unique::<AttachTmuxSession>(),
+            Self::Center => NotificationId::unique::<NewCenterTmux>(),
+        }
+    }
+}
+
+fn show_in_panel(
     workspace: &mut Workspace,
-    _: &AttachRemoteTmuxSession,
+    _: &AttachTmuxSession,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    let Some(host) = workspace.project().read(cx).ssh_remote_display_name(cx) else {
+    show(workspace, TmuxTarget::Panel, window, cx);
+}
+
+fn show_in_center(
+    workspace: &mut Workspace,
+    _: &NewCenterTmux,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    show(workspace, TmuxTarget::Center, window, cx);
+}
+
+fn show(
+    workspace: &mut Workspace,
+    target: TmuxTarget,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(location) = workspace.project().read(cx).tmux_display_name(cx) else {
         workspace.show_toast(
             workspace::Toast::new(
-                NotificationId::unique::<AttachRemoteTmuxSession>(),
-                "Remote tmux sessions are only available in SSH remote projects",
+                target.notification_id(),
+                "tmux sessions are unavailable for this project",
             ),
             cx,
         );
@@ -41,21 +75,23 @@ fn show(
 
     let weak_workspace = cx.entity().downgrade();
     workspace.toggle_modal(window, cx, move |window, cx| {
-        RemoteTmuxModal::new(weak_workspace, host, window, cx)
+        TmuxModal::new(weak_workspace, location, target, window, cx)
     });
 }
 
-struct RemoteTmuxModal {
+struct TmuxModal {
     editor: Entity<Editor>,
     workspace: WeakEntity<Workspace>,
-    host: SharedString,
+    location: SharedString,
+    target: TmuxTarget,
     error: Option<SharedString>,
 }
 
-impl RemoteTmuxModal {
+impl TmuxModal {
     fn new(
         workspace: WeakEntity<Workspace>,
-        host: String,
+        location: String,
+        target: TmuxTarget,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -67,7 +103,8 @@ impl RemoteTmuxModal {
         Self {
             editor,
             workspace,
-            host: host.into(),
+            location: location.into(),
+            target,
             error: None,
         }
     }
@@ -78,7 +115,7 @@ impl RemoteTmuxModal {
 
     fn confirm(&mut self, _: &Confirm, window: &mut Window, cx: &mut Context<Self>) {
         let session_name = self.editor.read(cx).text(cx);
-        let session = match RemoteTmuxSession::new(session_name) {
+        let session = match TmuxSession::new(session_name) {
             Ok(session) => session,
             Err(error) => {
                 self.error = Some(error.to_string().into());
@@ -89,36 +126,38 @@ impl RemoteTmuxModal {
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
-        let Some(panel) = workspace.read(cx).panel::<TerminalPanel>(cx) else {
-            return;
+        let task = match self.target {
+            TmuxTarget::Panel => workspace
+                .read(cx)
+                .panel::<TerminalPanel>(cx)
+                .map(|panel| {
+                    panel.update(cx, |panel, cx| panel.add_tmux_terminal(session, window, cx))
+                })
+                .unwrap_or_else(|| {
+                    gpui::Task::ready(Err(anyhow::anyhow!("terminal panel is unavailable")))
+                }),
+            TmuxTarget::Center => workspace.update(cx, |workspace, cx| {
+                TerminalPanel::add_center_tmux_terminal(workspace, session, window, cx)
+            }),
         };
-        panel
-            .update(cx, |panel, cx| {
-                panel.add_remote_tmux_terminal(session, window, cx)
-            })
-            .detach_and_prompt_err(
-                "Failed to attach remote tmux session",
-                window,
-                cx,
-                |_, _, _| None,
-            );
+        task.detach_and_prompt_err("Failed to attach tmux session", window, cx, |_, _, _| None);
         cx.emit(DismissEvent);
     }
 }
 
-impl EventEmitter<DismissEvent> for RemoteTmuxModal {}
-impl ModalView for RemoteTmuxModal {}
+impl EventEmitter<DismissEvent> for TmuxModal {}
+impl ModalView for TmuxModal {}
 
-impl Focusable for RemoteTmuxModal {
+impl Focusable for TmuxModal {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.editor.focus_handle(cx)
     }
 }
 
-impl Render for RemoteTmuxModal {
+impl Render for TmuxModal {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
-            .key_context("RemoteTmuxModal")
+            .key_context("TmuxModal")
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(Self::confirm))
             .elevation_2(cx)
@@ -130,9 +169,9 @@ impl Render for RemoteTmuxModal {
                     .pb_1()
                     .w_full()
                     .gap_1()
-                    .child(Headline::new("Attach Remote tmux Session").size(HeadlineSize::XSmall))
+                    .child(Headline::new("Attach tmux Session").size(HeadlineSize::XSmall))
                     .child(
-                        Label::new(format!("Attach an existing session on {}", self.host))
+                        Label::new(format!("Attach an existing session on {}", self.location))
                             .size(LabelSize::Small)
                             .color(Color::Muted),
                     ),

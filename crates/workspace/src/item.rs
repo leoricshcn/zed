@@ -407,6 +407,10 @@ pub trait Item: Focusable + EventEmitter<Self::Event> + Render + Sized {
 pub trait SerializableItem: Item {
     fn serialized_item_kind() -> &'static str;
 
+    fn serialized_item_id(&self, entity_id: EntityId) -> ItemId {
+        entity_id.as_u64()
+    }
+
     fn cleanup(
         workspace_id: WorkspaceId,
         alive_items: Vec<ItemId>,
@@ -437,6 +441,7 @@ pub trait SerializableItem: Item {
 
 pub trait SerializableItemHandle: ItemHandle {
     fn serialized_item_kind(&self) -> &'static str;
+    fn serialized_item_id(&self, cx: &App) -> ItemId;
     fn serialize(
         &self,
         workspace: &mut Workspace,
@@ -455,6 +460,10 @@ where
         T::serialized_item_kind()
     }
 
+    fn serialized_item_id(&self, cx: &App) -> ItemId {
+        self.read(cx).serialized_item_id(self.entity_id())
+    }
+
     fn serialize(
         &self,
         workspace: &mut Workspace,
@@ -462,8 +471,9 @@ where
         window: &mut Window,
         cx: &mut App,
     ) -> Option<Task<Result<()>>> {
+        let item_id = self.serialized_item_id(cx);
         self.update(cx, |this, cx| {
-            this.serialize(workspace, cx.entity_id().as_u64(), closing, window, cx)
+            this.serialize(workspace, item_id, closing, window, cx)
         })
     }
 
