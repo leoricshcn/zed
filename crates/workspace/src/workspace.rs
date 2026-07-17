@@ -291,6 +291,8 @@ actions!(
         MoveFocusedPanelToNextPosition,
         /// Creates a new file.
         NewFile,
+        /// Attaches an existing tmux session in the center pane.
+        NewCenterTmux,
         /// Creates a new file in a vertical split.
         NewFileSplitVertical,
         /// Creates a new file in a horizontal split.
@@ -7078,7 +7080,7 @@ impl Workspace {
 
                             Some(SerializedItem {
                                 kind: Arc::from(handle.serialized_item_kind()),
-                                item_id: handle.item_id().as_u64(),
+                                item_id: handle.serialized_item_id(cx),
                                 active: Some(handle.item_id()) == active_item_id,
                                 preview: pane.is_active_preview_item(handle.item_id()),
                             })
@@ -7318,7 +7320,7 @@ impl Workspace {
                         item_ids_by_kind
                             .entry(serializable_item_handle.serialized_item_kind())
                             .or_insert(Vec::new())
-                            .push(item.item_id().as_u64() as ItemId);
+                            .push(serializable_item_handle.serialized_item_id(cx));
                     }
 
                     if let Some(project_path) = item.project_path(cx) {

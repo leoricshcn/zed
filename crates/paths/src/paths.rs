@@ -17,6 +17,11 @@ pub const EDITORCONFIG_NAME: &str = ".editorconfig";
 /// Forks should change this to avoid colliding with Zed's user data.
 pub const APP_NAME: &str = "Zed";
 
+const MACOS_APP_DATA_NAME: &str = match option_env!("ZED_MACOS_APP_DATA_NAME") {
+    Some(name) => name,
+    None => APP_NAME,
+};
+
 /// Lowercased form of [`APP_NAME`], for use in XDG-style paths on
 /// Linux/FreeBSD and the macOS `~/.config` fallback.
 pub const APP_NAME_LOWERCASE: &str = {
@@ -148,7 +153,7 @@ pub fn data_dir() -> &'static PathBuf {
         } else if cfg!(target_os = "macos") {
             home_dir()
                 .join("Library/Application Support")
-                .join(APP_NAME)
+                .join(MACOS_APP_DATA_NAME)
         } else if cfg!(any(target_os = "linux", target_os = "freebsd")) {
             if let Ok(flatpak_xdg_data) = std::env::var("FLATPAK_XDG_DATA_HOME") {
                 flatpak_xdg_data.into()
@@ -170,7 +175,10 @@ pub fn state_dir() -> &'static PathBuf {
     static STATE_DIR: OnceLock<PathBuf> = OnceLock::new();
     STATE_DIR.get_or_init(|| {
         if cfg!(target_os = "macos") {
-            return home_dir().join(".local").join("state").join(APP_NAME);
+            return home_dir()
+                .join(".local")
+                .join("state")
+                .join(MACOS_APP_DATA_NAME);
         }
 
         if cfg!(any(target_os = "linux", target_os = "freebsd")) {
@@ -196,7 +204,7 @@ pub fn temp_dir() -> &'static PathBuf {
         if cfg!(target_os = "macos") {
             return dirs::cache_dir()
                 .expect("failed to determine cachesDirectory directory")
-                .join(APP_NAME);
+                .join(MACOS_APP_DATA_NAME);
         }
 
         if cfg!(target_os = "windows") {
@@ -229,7 +237,7 @@ pub fn logs_dir() -> &'static PathBuf {
     static LOGS_DIR: OnceLock<PathBuf> = OnceLock::new();
     LOGS_DIR.get_or_init(|| {
         if cfg!(target_os = "macos") {
-            home_dir().join("Library/Logs").join(APP_NAME)
+            home_dir().join("Library/Logs").join(MACOS_APP_DATA_NAME)
         } else {
             data_dir().join("logs")
         }
@@ -245,13 +253,13 @@ pub fn remote_server_state_dir() -> &'static PathBuf {
 /// Returns the path to the `Zed.log` file.
 pub fn log_file() -> &'static PathBuf {
     static LOG_FILE: OnceLock<PathBuf> = OnceLock::new();
-    LOG_FILE.get_or_init(|| logs_dir().join(format!("{}.log", APP_NAME)))
+    LOG_FILE.get_or_init(|| logs_dir().join(format!("{}.log", MACOS_APP_DATA_NAME)))
 }
 
 /// Returns the path to the `Zed.log.old` file.
 pub fn old_log_file() -> &'static PathBuf {
     static OLD_LOG_FILE: OnceLock<PathBuf> = OnceLock::new();
-    OLD_LOG_FILE.get_or_init(|| logs_dir().join(format!("{}.log.old", APP_NAME)))
+    OLD_LOG_FILE.get_or_init(|| logs_dir().join(format!("{}.log.old", MACOS_APP_DATA_NAME)))
 }
 
 /// Returns the path to the database directory.

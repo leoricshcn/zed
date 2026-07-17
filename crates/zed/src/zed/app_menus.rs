@@ -5,6 +5,7 @@ use terminal_view::terminal_panel;
 use zed_actions::{Quit, assistant, debug_panel, dev, git_panel, project_panel};
 
 pub fn app_menus(cx: &mut App) -> Vec<Menu> {
+    let display_name = ReleaseChannel::global(cx).display_name();
     let mut view_items = vec![
         MenuItem::action(
             "Zoom In",
@@ -60,10 +61,10 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
 
     vec![
         Menu {
-            name: "Zed".into(),
+            name: display_name.into(),
             disabled: false,
             items: vec![
-                MenuItem::action("About Zed", zed_actions::About),
+                MenuItem::action(format!("About {display_name}"), zed_actions::About),
                 MenuItem::action("Check for Updates", auto_update::Check),
                 MenuItem::separator(),
                 MenuItem::submenu(Menu::new("Settings").items([

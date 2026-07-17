@@ -1,7 +1,7 @@
 use std::{cmp, path::PathBuf, process::ExitStatus, sync::Arc, time::Duration};
 
 use crate::{
-    TerminalView, default_working_directory,
+    TerminalSource, TerminalView, default_working_directory,
     persistence::{
         SerializedItems, SerializedTerminalPanel, deserialize_terminal_panel, serialize_pane_group,
     },
@@ -16,7 +16,7 @@ use gpui::{
     Window, actions,
 };
 use itertools::Itertools;
-use project::{Fs, Project};
+use project::{Fs, Project, terminals::TmuxSession};
 
 use settings::{Settings, TerminalDockPosition};
 use task::{RevealStrategy, RevealTarget, Shell, ShellBuilder, SpawnInTerminal, TaskId};
@@ -28,10 +28,10 @@ use ui::{
 use util::{ResultExt, TryFutureExt};
 use workspace::{
     ActivateNextPane, ActivatePane, ActivatePaneDown, ActivatePaneLeft, ActivatePaneRight,
-    ActivatePaneUp, ActivatePreviousPane, DraggedTab, ItemId, MoveItemToPane,
-    MoveItemToPaneInDirection, MovePaneDown, MovePaneLeft, MovePaneRight, MovePaneUp, Pane,
-    PaneGroup, SplitDirection, SplitDown, SplitLeft, SplitMode, SplitRight, SplitUp, SwapPaneDown,
-    SwapPaneLeft, SwapPaneRight, SwapPaneUp, ToggleZoom, Workspace,
+    ActivatePaneUp, ActivatePreviousPane, DraggedTab, MoveItemToPane, MoveItemToPaneInDirection,
+    MovePaneDown, MovePaneLeft, MovePaneRight, MovePaneUp, Pane, PaneGroup, SplitDirection,
+    SplitDown, SplitLeft, SplitMode, SplitRight, SplitUp, SwapPaneDown, SwapPaneLeft,
+    SwapPaneRight, SwapPaneUp, ToggleZoom, Workspace,
     dock::{DockPosition, Panel, PanelEvent, PanelHandle},
     item::SerializableItem,
     move_active_item, pane,
@@ -48,7 +48,9 @@ actions!(
         /// Toggles the terminal panel.
         Toggle,
         /// Toggles focus on the terminal panel.
-        ToggleFocus
+        ToggleFocus,
+        /// Attaches an existing tmux session.
+        AttachTmuxSession
     ]
 );
 
@@ -80,15 +82,18 @@ pub struct TerminalPanel {
     fs: Arc<dyn Fs>,
     workspace: WeakEntity<Workspace>,
     pending_serialization: Task<Option<()>>,
+    pub(crate) restoring: bool,
     pending_terminals_to_add: usize,
     deferred_tasks: HashMap<TaskId, Task<()>>,
     assistant_enabled: bool,
+    tmux_available: bool,
     active: bool,
 }
 
 impl TerminalPanel {
     pub fn new(workspace: &Workspace, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let project = workspace.project();
+        let tmux_available = project.read(cx).tmux_display_name(cx).is_some();
         let pane = new_terminal_pane(workspace.weak_handle(), project.clone(), false, window, cx);
         let center = PaneGroup::new(pane.clone());
         let terminal_panel = Self {
@@ -97,9 +102,11 @@ impl TerminalPanel {
             fs: workspace.app_state().fs.clone(),
             workspace: workspace.weak_handle(),
             pending_serialization: Task::ready(None),
+            restoring: false,
             pending_terminals_to_add: 0,
             deferred_tasks: HashMap::default(),
             assistant_enabled: false,
+            tmux_available,
             active: false,
         };
         terminal_panel.apply_tab_bar_buttons(&terminal_panel.active_pane, cx);
@@ -119,6 +126,7 @@ impl TerminalPanel {
         cx: &mut Context<Self>,
     ) {
         let assistant_enabled = self.assistant_enabled;
+        let tmux_available = self.tmux_available;
         terminal_pane.update(cx, |pane, cx| {
             pane.set_render_tab_bar_buttons(cx, move |pane, window, cx| {
                 let split_context = pane
@@ -154,6 +162,9 @@ impl TerminalPanel {
                                             "New Terminal",
                                             workspace::NewTerminal::default().boxed_clone(),
                                         )
+                                        .when(tmux_available, |menu| {
+                                            menu.action("New tmux", AttachTmuxSession.boxed_clone())
+                                        })
                                         // We want the focus to go back to terminal panel once task modal is dismissed,
                                         // hence we focus that first. Otherwise, we'd end up without a focused element, as
                                         // context menu will be gone the moment we spawn the modal.
@@ -232,27 +243,26 @@ impl TerminalPanel {
         workspace: WeakEntity<Workspace>,
         mut cx: AsyncWindowContext,
     ) -> Result<Entity<Self>> {
-        let mut terminal_panel = None;
-
-        if let Some((database_id, serialization_key, kvp)) = workspace
+        let serialized_panel = if let Some((database_id, serialization_key, kvp)) = workspace
             .read_with(&cx, |workspace, cx| {
                 workspace
                     .database_id()
                     .zip(TerminalPanel::serialization_key(workspace))
                     .map(|(id, key)| (id, key, KeyValueStore::global(cx)))
-            })
-            .ok()
-            .flatten()
-            && let Some(serialized_panel) = cx
-                .background_spawn(async move { kvp.read_kvp(&serialization_key) })
-                .await
-                .log_err()
-                .flatten()
-                .map(|panel| serde_json::from_str::<SerializedTerminalPanel>(&panel))
-                .transpose()
-                .log_err()
-                .flatten()
-            && let Ok(serialized) = workspace
+            })? {
+            cx.background_spawn(async move { kvp.read_kvp(&serialization_key) })
+                .await?
+                .map(|panel| {
+                    serde_json::from_str::<SerializedTerminalPanel>(&panel)
+                        .map(|panel| (database_id, panel))
+                })
+                .transpose()?
+        } else {
+            None
+        };
+
+        let terminal_panel = if let Some((database_id, serialized_panel)) = serialized_panel {
+            workspace
                 .update_in(&mut cx, |workspace, window, cx| {
                     deserialize_terminal_panel(
                         workspace.weak_handle(),
@@ -263,13 +273,7 @@ impl TerminalPanel {
                         cx,
                     )
                 })?
-                .await
-        {
-            terminal_panel = Some(serialized);
-        }
-
-        let terminal_panel = if let Some(panel) = terminal_panel {
-            panel
+                .await?
         } else {
             workspace.update_in(&mut cx, |workspace, window, cx| {
                 cx.new(|cx| TerminalPanel::new(workspace, window, cx))
@@ -291,7 +295,10 @@ impl TerminalPanel {
                     .panes()
                     .into_iter()
                     .flat_map(|pane| pane.read(cx).items())
-                    .map(|item| item.item_id().as_u64() as ItemId)
+                    .filter_map(|item| {
+                        let terminal_view = item.act_as::<TerminalView>(cx)?;
+                        Some(terminal_view.read(cx).serialized_item_id())
+                    })
                     .collect();
                 workspace.database_id().map(|workspace_id| {
                     TerminalView::cleanup(workspace_id, alive_item_ids, window, cx)
@@ -448,6 +455,11 @@ impl TerminalPanel {
         } else {
             None
         };
+        let source = terminal_view
+            .as_ref()
+            .map(|terminal_view| terminal_view.read(cx).source().clone())
+            .unwrap_or_default();
+        let source_for_spawn = source.clone();
         let working_directory = if clone {
             terminal_view
                 .as_ref()
@@ -470,13 +482,16 @@ impl TerminalPanel {
         };
         cx.spawn_in(window, async move |panel, cx| {
             let terminal = project
-                .update(cx, |project, cx| match terminal_view {
-                    Some(view) => project.clone_terminal(
-                        &view.read(cx).terminal.clone(),
-                        cx,
-                        working_directory,
-                    ),
-                    None => project.create_terminal_shell(working_directory, cx),
+                .update(cx, |project, cx| match source_for_spawn {
+                    TerminalSource::Shell => match terminal_view {
+                        Some(view) => project.clone_terminal(
+                            &view.read(cx).terminal.clone(),
+                            cx,
+                            working_directory,
+                        ),
+                        None => project.create_terminal_shell(working_directory, cx),
+                    },
+                    TerminalSource::Tmux { session } => project.create_tmux_terminal(session, cx),
                 })
                 .await
                 .log_err()?;
@@ -484,11 +499,12 @@ impl TerminalPanel {
             panel
                 .update_in(cx, move |terminal_panel, window, cx| {
                     let terminal_view = Box::new(cx.new(|cx| {
-                        TerminalView::new(
+                        TerminalView::new_with_source(
                             terminal.clone(),
                             weak_workspace.clone(),
                             database_id,
                             project.downgrade(),
+                            source,
                             window,
                             cx,
                         )
@@ -747,6 +763,40 @@ impl TerminalPanel {
         ) -> Task<Result<Entity<Terminal>>>
         + 'static,
     ) -> Task<Result<WeakEntity<Terminal>>> {
+        Self::add_center_terminal_with_source(
+            workspace,
+            TerminalSource::Shell,
+            window,
+            cx,
+            create_terminal,
+        )
+    }
+
+    pub(crate) fn add_center_tmux_terminal(
+        workspace: &mut Workspace,
+        session: TmuxSession,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Task<Result<WeakEntity<Terminal>>> {
+        let source = TerminalSource::Tmux {
+            session: session.clone(),
+        };
+        Self::add_center_terminal_with_source(workspace, source, window, cx, move |project, cx| {
+            project.create_tmux_terminal(session, cx)
+        })
+    }
+
+    fn add_center_terminal_with_source(
+        workspace: &mut Workspace,
+        source: TerminalSource,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+        create_terminal: impl FnOnce(
+            &mut Project,
+            &mut Context<Project>,
+        ) -> Task<Result<Entity<Terminal>>>
+        + 'static,
+    ) -> Task<Result<WeakEntity<Terminal>>> {
         if !is_enabled_in_workspace(workspace, cx) {
             return Task::ready(Err(anyhow!(
                 "terminal not yet supported for remote projects"
@@ -758,11 +808,12 @@ impl TerminalPanel {
 
             workspace.update_in(cx, |workspace, window, cx| {
                 let terminal_view = cx.new(|cx| {
-                    TerminalView::new(
+                    TerminalView::new_with_source(
                         terminal.clone(),
                         workspace.weak_handle(),
                         workspace.database_id(),
                         workspace.project().downgrade(),
+                        source,
                         window,
                         cx,
                     )
@@ -839,6 +890,66 @@ impl TerminalPanel {
         cx: &mut Context<Self>,
     ) -> Task<Result<WeakEntity<Terminal>>> {
         self.add_terminal_shell_internal(false, cwd, reveal_strategy, window, cx)
+    }
+
+    pub(crate) fn add_tmux_terminal(
+        &mut self,
+        session: TmuxSession,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<WeakEntity<Terminal>>> {
+        let workspace = self.workspace.clone();
+        cx.spawn_in(window, async move |terminal_panel, cx| {
+            let pane = terminal_panel.update(cx, |terminal_panel, _| {
+                terminal_panel.pending_terminals_to_add += 1;
+                terminal_panel.active_pane.clone()
+            })?;
+            let project = workspace.read_with(cx, |workspace, _| workspace.project().clone())?;
+            let terminal = project
+                .update(cx, |project, cx| {
+                    project.create_tmux_terminal(session.clone(), cx)
+                })
+                .await;
+
+            let result = match terminal {
+                Ok(terminal) => workspace.update_in(cx, |workspace, window, cx| {
+                    let terminal_view = Box::new(cx.new(|cx| {
+                        TerminalView::new_with_source(
+                            terminal.clone(),
+                            workspace.weak_handle(),
+                            workspace.database_id(),
+                            workspace.project().downgrade(),
+                            TerminalSource::Tmux { session },
+                            window,
+                            cx,
+                        )
+                    }));
+                    workspace.focus_panel::<Self>(window, cx);
+                    pane.update(cx, |pane, cx| {
+                        pane.add_item(terminal_view, true, true, None, window, cx);
+                    });
+                    Ok(terminal.downgrade())
+                })?,
+                Err(error) => {
+                    pane.update_in(cx, |pane, window, cx| {
+                        let focus = pane.has_focus(window, cx);
+                        let failed_to_spawn = cx.new(|cx| FailedToSpawnTerminal {
+                            error: error.to_string(),
+                            focus_handle: cx.focus_handle(),
+                        });
+                        pane.add_item(Box::new(failed_to_spawn), true, focus, None, window, cx);
+                    })?;
+                    Err(error)
+                }
+            };
+
+            terminal_panel.update(cx, |terminal_panel, cx| {
+                terminal_panel.pending_terminals_to_add =
+                    terminal_panel.pending_terminals_to_add.saturating_sub(1);
+                terminal_panel.serialize(cx)
+            })?;
+            result
+        })
     }
 
     fn add_local_terminal_shell(
@@ -933,6 +1044,10 @@ impl TerminalPanel {
     }
 
     fn serialize(&mut self, cx: &mut Context<Self>) {
+        if self.restoring {
+            return;
+        }
+
         let Some(serialization_key) = self
             .workspace
             .read_with(cx, |workspace, _| {
@@ -1718,14 +1833,15 @@ impl RenderOnce for InlineAssistTabBarButton {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZero;
+    use std::{num::NonZero, path::Path};
 
     use super::*;
+    use crate::persistence::{SerializedTerminalSource, TerminalDb};
     use gpui::{Modifiers, TestAppContext, UpdateGlobal as _, VisualTestContext};
     use pretty_assertions::assert_eq;
     use project::FakeFs;
     use settings::SettingsStore;
-    use workspace::MultiWorkspace;
+    use workspace::{ItemId, MultiWorkspace, WorkspaceId};
 
     #[test]
     fn test_prepare_empty_task() {
@@ -1973,6 +2089,191 @@ mod tests {
             .expect("Failed to initialize workspace with terminal panel");
 
         (window_handle, terminal_panel)
+    }
+
+    async fn init_persistent_workspace_with_panel(
+        root_path: &Path,
+        cx: &mut TestAppContext,
+    ) -> (
+        gpui::WindowHandle<MultiWorkspace>,
+        Entity<TerminalPanel>,
+        WorkspaceId,
+    ) {
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(root_path, serde_json::json!({})).await;
+        let project = Project::test(fs, [root_path], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let (terminal_panel, workspace_id, flush_workspace) = window_handle
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    workspace.set_random_database_id();
+                    let workspace_id = workspace
+                        .database_id()
+                        .expect("test workspace should have a database id");
+                    let panel = cx.new(|cx| TerminalPanel::new(workspace, window, cx));
+                    workspace.add_panel(panel.clone(), window, cx);
+                    let flush_workspace = workspace.flush_serialization(window, cx);
+                    (panel, workspace_id, flush_workspace)
+                })
+            })
+            .expect("initialize persistent terminal panel");
+        flush_workspace.await;
+        assert!(
+            terminal_panel.read_with(cx, |terminal_panel, _| terminal_panel.tmux_available),
+            "local projects should expose New tmux"
+        );
+
+        (window_handle, terminal_panel, workspace_id)
+    }
+
+    #[gpui::test]
+    async fn test_local_center_tmux_uses_terminal_serialization_chain(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        init_test(cx);
+
+        let (window_handle, _terminal_panel, workspace_id) =
+            init_persistent_workspace_with_panel(Path::new("/center-tmux-project"), cx).await;
+        let session =
+            TmuxSession::new("api worker".to_string()).expect("tmux session name should be valid");
+        let source = TerminalSource::Tmux { session };
+
+        window_handle
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    TerminalPanel::add_center_terminal_with_source(
+                        workspace,
+                        source,
+                        window,
+                        cx,
+                        |project, cx| project.create_terminal_shell(None, cx),
+                    )
+                })
+            })
+            .expect("workspace window should remain open")
+            .await
+            .expect("center terminal should be created");
+        cx.run_until_parked();
+
+        let (source, item_id) = window_handle
+            .read_with(cx, |multi_workspace, cx| {
+                let workspace = multi_workspace.workspace().read(cx);
+                let active_item = workspace
+                    .active_pane()
+                    .read(cx)
+                    .active_item()
+                    .expect("center pane should have an active item");
+                let terminal_view = active_item
+                    .downcast::<TerminalView>()
+                    .expect("active center item should be a terminal")
+                    .read(cx);
+                (
+                    terminal_view.source().clone(),
+                    terminal_view.serialized_item_id(),
+                )
+            })
+            .expect("workspace window should remain open");
+
+        assert_eq!(source.default_title().as_deref(), Some("api worker"));
+        assert_eq!(source.tmux_session_name().as_deref(), Some("api worker"));
+        assert_terminal_source_eventually(item_id, workspace_id, "api worker", cx).await;
+    }
+
+    #[gpui::test]
+    async fn test_local_panel_tmux_uses_terminal_serialization_chain(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        init_test(cx);
+
+        let (window_handle, terminal_panel, workspace_id) =
+            init_persistent_workspace_with_panel(Path::new("/panel-tmux-project"), cx).await;
+        let (workspace, project) = window_handle
+            .read_with(cx, |multi_workspace, cx| {
+                let workspace = multi_workspace.workspace().clone();
+                let project = workspace.read(cx).project().clone();
+                (workspace, project)
+            })
+            .expect("workspace window should remain open");
+        let terminal = project
+            .update(cx, |project, cx| project.create_terminal_shell(None, cx))
+            .await
+            .expect("terminal should be created");
+        let session = TmuxSession::new("panel worker".to_string())
+            .expect("tmux session name should be valid");
+
+        let (item_id, terminal_view) = window_handle
+            .update(cx, |_, window, cx| {
+                let terminal_view = cx.new(|cx| {
+                    TerminalView::new_with_source(
+                        terminal,
+                        workspace.downgrade(),
+                        Some(workspace_id),
+                        project.downgrade(),
+                        TerminalSource::Tmux { session },
+                        window,
+                        cx,
+                    )
+                });
+                let item_id = terminal_view.read(cx).serialized_item_id();
+                let pane = terminal_panel.read(cx).active_pane.clone();
+                pane.update(cx, |pane, cx| {
+                    pane.add_item(
+                        Box::new(terminal_view.clone()),
+                        true,
+                        true,
+                        None,
+                        window,
+                        cx,
+                    )
+                });
+                (item_id, terminal_view)
+            })
+            .expect("workspace window should remain open");
+        cx.run_until_parked();
+
+        let expected = Some(SerializedTerminalSource::Tmux("panel worker".to_string()));
+        let source = terminal_source_eventually(item_id, workspace_id, cx).await;
+        let needs_serialize =
+            terminal_view.read_with(cx, |terminal_view, _| terminal_view.needs_serialize);
+        assert_eq!(
+            source, expected,
+            "normal item chain did not persist the panel tmux source; needs_serialize={needs_serialize}"
+        );
+    }
+
+    async fn assert_terminal_source_eventually(
+        item_id: ItemId,
+        workspace_id: WorkspaceId,
+        expected_session_name: &str,
+        cx: &mut TestAppContext,
+    ) {
+        let expected = Some(SerializedTerminalSource::Tmux(
+            expected_session_name.to_string(),
+        ));
+        let source = terminal_source_eventually(item_id, workspace_id, cx).await;
+        assert_eq!(
+            source, expected,
+            "terminal source was not serialized through the normal item chain"
+        );
+    }
+
+    async fn terminal_source_eventually(
+        item_id: ItemId,
+        workspace_id: WorkspaceId,
+        cx: &mut TestAppContext,
+    ) -> Option<SerializedTerminalSource> {
+        let mut source = None;
+        for _ in 0..100 {
+            source = cx
+                .update(|cx| TerminalDb::global(cx).get_terminal_source(item_id, workspace_id))
+                .expect("read terminal source");
+            if source.is_some() {
+                return source;
+            }
+            cx.background_executor
+                .timer(Duration::from_millis(10))
+                .await;
+        }
+        source
     }
 
     #[gpui::test]

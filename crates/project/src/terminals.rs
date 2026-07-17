@@ -6,7 +6,7 @@ use async_channel::bounded;
 use futures::{FutureExt, future::Shared};
 use itertools::Itertools as _;
 use language::LanguageName;
-use remote::{Interactive, RemoteClient};
+use remote::{Interactive, RemoteClient, RemoteConnectionOptions};
 use settings::{Settings, SettingsLocation};
 use std::{
     borrow::Cow,
@@ -28,7 +28,164 @@ pub struct Terminals {
     pub(crate) local_handles: Vec<WeakEntity<terminal::Terminal>>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TmuxSession(String);
+
+impl TmuxSession {
+    pub fn new(session_name: String) -> Result<Self> {
+        anyhow::ensure!(
+            !session_name.contains('\0'),
+            "tmux session name cannot contain NUL"
+        );
+        Ok(Self(session_name))
+    }
+
+    pub fn name(&self) -> &str {
+        &self.0
+    }
+
+    fn command(&self) -> (&'static str, Vec<String>) {
+        (
+            "tmux",
+            vec![
+                "-N".to_string(),
+                "attach-session".to_string(),
+                "-t".to_string(),
+                format!("={}", self.0),
+            ],
+        )
+    }
+}
+
+fn local_tmux_shell(program: &str, args: Vec<String>) -> Shell {
+    Shell::WithArguments {
+        program: program.to_string(),
+        args,
+        title_override: None,
+    }
+}
+
 impl Project {
+    pub fn tmux_display_name(&self, cx: &App) -> Option<String> {
+        let Some(remote_client) = self.remote_client.as_ref() else {
+            return Some("this machine".to_string());
+        };
+        match remote_client.read(cx).connection_options() {
+            RemoteConnectionOptions::Ssh(options) => {
+                Some(options.nickname.unwrap_or_else(|| options.host.to_string()))
+            }
+            _ => None,
+        }
+    }
+
+    pub fn create_tmux_terminal(
+        &mut self,
+        session: TmuxSession,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<Terminal>>> {
+        let remote_client = self.remote_client.clone();
+        if let Some(remote_client) = remote_client.as_ref()
+            && !matches!(
+                remote_client.read(cx).connection_options(),
+                RemoteConnectionOptions::Ssh(_)
+            )
+        {
+            return Task::ready(Err(anyhow::anyhow!(
+                "tmux sessions can only be attached in local or SSH remote projects"
+            )));
+        }
+
+        let settings = TerminalSettings::get_global(cx).clone();
+        let path_style = self.path_style(cx);
+        let (program, args) = session.command();
+        let local_working_directory = if remote_client.is_none() {
+            self.active_project_directory(cx)
+        } else {
+            None
+        };
+        let local_environment = if remote_client.is_none() {
+            Some(self.resolve_directory_environment(
+                &get_system_shell(),
+                local_working_directory.clone(),
+                None,
+                cx,
+            ))
+        } else {
+            None
+        };
+        cx.spawn(async move |project, cx| {
+            let mut local_environment = match local_environment {
+                Some(local_environment) => local_environment.await.unwrap_or_default(),
+                None => HashMap::default(),
+            };
+            if remote_client.is_none() {
+                local_environment.extend(settings.env.clone());
+            }
+
+            let builder = project
+                .update(cx, move |_, cx| {
+                    let (working_directory, shell, env, is_remote_terminal) = match remote_client {
+                        Some(remote_client) => {
+                            let (shell, env) = create_remote_shell(
+                                Some((program, &args)),
+                                HashMap::default(),
+                                None,
+                                remote_client,
+                                cx,
+                            )?;
+                            (None, shell, env, true)
+                        }
+                        None => (
+                            local_working_directory.map(|path| path.to_path_buf()),
+                            local_tmux_shell(program, args),
+                            local_environment,
+                            false,
+                        ),
+                    };
+                    anyhow::Ok(TerminalBuilder::new(
+                        working_directory,
+                        None,
+                        shell,
+                        env,
+                        settings.cursor_shape,
+                        settings.alternate_scroll,
+                        settings.max_scroll_history_lines,
+                        settings.path_hyperlink_regexes,
+                        settings.path_hyperlink_timeout_ms,
+                        is_remote_terminal,
+                        cx.entity_id().as_u64(),
+                        None,
+                        cx,
+                        Vec::new(),
+                        path_style,
+                    ))
+                })??
+                .await?;
+
+            project.update(cx, move |this, cx| {
+                let terminal_handle = cx.new(|cx| builder.subscribe(cx));
+                this.terminals
+                    .local_handles
+                    .push(terminal_handle.downgrade());
+
+                let id = terminal_handle.entity_id();
+                cx.observe_release(&terminal_handle, move |project, _terminal, cx| {
+                    let handles = &mut project.terminals.local_handles;
+                    if let Some(index) = handles
+                        .iter()
+                        .position(|terminal| terminal.entity_id() == id)
+                    {
+                        handles.remove(index);
+                        cx.notify();
+                    }
+                })
+                .detach();
+
+                terminal_handle
+            })
+        })
+    }
+
     pub fn active_entry_directory(&self, cx: &App) -> Option<PathBuf> {
         let entry_id = self.active_entry()?;
         let worktree = self.worktree_for_entry(entry_id, cx)?;
@@ -190,7 +347,7 @@ impl Project {
                                         .unwrap_or_else(get_default_system_shell);
 
                                     create_remote_shell(
-                                        Some((&shell, &args)),
+                                        Some((shell.as_str(), args.as_slice())),
                                         env,
                                         path,
                                         remote_client,
@@ -198,10 +355,9 @@ impl Project {
                                     )?
                                 }
                                 _ => create_remote_shell(
-                                    spawn_task
-                                        .command
-                                        .as_ref()
-                                        .map(|command| (command, &spawn_task.args)),
+                                    spawn_task.command.as_ref().map(|command| {
+                                        (command.as_str(), spawn_task.args.as_slice())
+                                    }),
                                     env,
                                     path,
                                     remote_client,
@@ -613,7 +769,7 @@ impl Project {
 }
 
 fn create_remote_shell(
-    spawn_command: Option<(&String, &Vec<String>)>,
+    spawn_command: Option<(&str, &[String])>,
     mut env: HashMap<String, String>,
     working_directory: Option<Arc<Path>>,
     remote_client: Entity<RemoteClient>,
@@ -622,13 +778,13 @@ fn create_remote_shell(
     insert_zed_terminal_env(&mut env, &release_channel::AppVersion::global(cx));
 
     let (program, args) = match spawn_command {
-        Some((program, args)) => (Some(program.clone()), args),
-        None => (None, &Vec::new()),
+        Some((program, args)) => (Some(program.to_string()), args),
+        None => (None, &[] as &[String]),
     };
 
     let command = remote_client.read(cx).build_command(
         program,
-        args.as_slice(),
+        args,
         &env,
         working_directory.map(|path| path.display().to_string()),
         None,
@@ -719,6 +875,64 @@ fn quote_cmd_command_arg_for_outer_shell(arg: &str, shell_kind: ShellKind) -> Op
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn tmux_session_builds_one_closed_command() {
+        let session = TmuxSession::new("api; $(touch /tmp/not-run) 'worker'".to_string())
+            .expect("valid session name");
+
+        assert_eq!(
+            session.command(),
+            (
+                "tmux",
+                vec![
+                    "-N".to_string(),
+                    "attach-session".to_string(),
+                    "-t".to_string(),
+                    "=api; $(touch /tmp/not-run) 'worker'".to_string(),
+                ]
+            )
+        );
+    }
+
+    #[test]
+    fn local_tmux_shell_runs_the_exact_tmux_command() {
+        let session = TmuxSession::new("api; $(touch /tmp/not-run) 'worker'".to_string())
+            .expect("valid session name");
+        let (program, args) = session.command();
+
+        assert_eq!(
+            local_tmux_shell(program, args),
+            Shell::WithArguments {
+                program: "tmux".to_string(),
+                args: vec![
+                    "-N".to_string(),
+                    "attach-session".to_string(),
+                    "-t".to_string(),
+                    "=api; $(touch /tmp/not-run) 'worker'".to_string(),
+                ],
+                title_override: None,
+            }
+        );
+    }
+
+    #[test]
+    fn tmux_session_preserves_names_and_rejects_nul() {
+        assert!(TmuxSession::new("api\0worker".to_string()).is_err());
+        assert_eq!(
+            TmuxSession::new(String::new())
+                .expect("empty names are sent to tmux unchanged")
+                .command()
+                .1,
+            ["-N", "attach-session", "-t", "="]
+        );
+        assert_eq!(
+            TmuxSession::new(" api worker ".to_string())
+                .expect("spaces are preserved")
+                .name(),
+            " api worker "
+        );
+    }
 
     fn prepared_cmd_task(command_arg: &str) -> SpawnInTerminal {
         SpawnInTerminal {

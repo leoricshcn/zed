@@ -1,7 +1,7 @@
 use crate::{
-    CloseWindow, NewCenterTerminal, NewFile, NewTerminal, OpenInTerminal, OpenOptions,
-    OpenTerminal, OpenVisible, SplitDirection, ToggleFileFinder, ToggleProjectSymbols, ToggleZoom,
-    Workspace, WorkspaceItemBuilder, ZoomIn, ZoomOut,
+    CloseWindow, NewCenterTerminal, NewCenterTmux, NewFile, NewTerminal, OpenInTerminal,
+    OpenOptions, OpenTerminal, OpenVisible, SplitDirection, ToggleFileFinder, ToggleProjectSymbols,
+    ToggleZoom, Workspace, WorkspaceItemBuilder, ZoomIn, ZoomOut,
     focus_follows_mouse::FocusFollowsMouse as _,
     invalid_item_view::InvalidItemView,
     item::{
@@ -4203,6 +4203,10 @@ fn default_render_tab_bar_buttons(
         Some(_) => (false, pane.items_len() > 1),
         None => (false, false),
     };
+    let tmux_available = pane
+        .project
+        .upgrade()
+        .is_some_and(|project| project.read(cx).tmux_display_name(cx).is_some());
     // Ideally we would return a vec of elements here to pass directly to the [TabBar]'s
     // `end_slot`, but due to needing a view here that isn't possible.
     let right_children = h_flex()
@@ -4229,6 +4233,9 @@ fn default_render_tab_bar_buttons(
                                 "New Center Terminal",
                                 NewCenterTerminal::default().boxed_clone(),
                             )
+                            .when(tmux_available, |menu| {
+                                menu.action("New tmux", NewCenterTmux.boxed_clone())
+                            })
                     }))
                 }),
         )

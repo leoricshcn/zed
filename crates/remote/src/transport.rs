@@ -20,6 +20,75 @@ pub mod mock;
 pub mod ssh;
 pub mod wsl;
 
+#[cfg(all(
+    target_os = "macos",
+    any(debug_assertions, feature = "build-remote-server-binary")
+))]
+const BUNDLED_LINUX_X86_64_REMOTE_SERVER: &str = "zed-remote-server-linux-x86_64.gz";
+
+#[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
+struct BuiltRemoteServer {
+    key: String,
+    path: std::path::PathBuf,
+    completed_at: std::time::Instant,
+}
+
+#[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
+static REMOTE_SERVER_BUILD_LOCK: std::sync::LazyLock<
+    futures::lock::Mutex<Option<BuiltRemoteServer>>,
+> = std::sync::LazyLock::new(|| futures::lock::Mutex::new(None));
+
+#[cfg(all(
+    target_os = "macos",
+    any(debug_assertions, feature = "build-remote-server-binary")
+))]
+fn bundled_remote_server_path_for_executable(
+    platform: &RemotePlatform,
+    executable_path: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    if platform.os != RemoteOs::Linux || platform.arch != RemoteArch::X86_64 {
+        return None;
+    }
+
+    let macos_directory = executable_path.parent()?;
+    if macos_directory.file_name()? != "MacOS" {
+        return None;
+    }
+
+    let contents_directory = macos_directory.parent()?;
+    if contents_directory.file_name()? != "Contents" {
+        return None;
+    }
+
+    let bundled_path = contents_directory
+        .join("Resources")
+        .join("remote_servers")
+        .join(BUNDLED_LINUX_X86_64_REMOTE_SERVER);
+    bundled_path.is_file().then_some(bundled_path)
+}
+
+#[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
+fn bundled_remote_server_path(platform: &RemotePlatform) -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        match std::env::current_exe() {
+            Ok(executable_path) => {
+                bundled_remote_server_path_for_executable(platform, &executable_path)
+            }
+            Err(error) => {
+                log::warn!("failed to locate the current executable: {error}");
+                None
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = platform;
+        None
+    }
+}
+
 /// Parses the output of `uname -sm` to determine the remote platform.
 /// Takes the last line to skip possible shell initialization output.
 fn parse_platform(output: &str) -> Result<RemotePlatform> {
@@ -261,18 +330,34 @@ async fn build_remote_server_from_source(
         }
     }
 
-    // By default, we make building remote server from source opt-out and we do not force artifact compression
-    // for quicker builds.
-    let build_remote_server =
-        std::env::var("ZED_BUILD_REMOTE_SERVER").unwrap_or("nocompress".into());
+    let build_remote_server = std::env::var("ZED_BUILD_REMOTE_SERVER").unwrap_or_else(|_| {
+        if cfg!(debug_assertions) {
+            "nocompress".into()
+        } else {
+            "if-missing".into()
+        }
+    });
 
     if let "never" = &*build_remote_server {
         return Ok(None);
-    } else if let "false" | "no" | "off" | "0" = &*build_remote_server {
+    } else if let "false" | "no" | "off" | "0" | "if-missing" = &*build_remote_server {
         if binary_exists_on_server {
             return Ok(None);
         }
-        log::warn!("ZED_BUILD_REMOTE_SERVER is disabled, but no server binary exists on the server")
+        if build_remote_server != "if-missing" {
+            log::warn!(
+                "ZED_BUILD_REMOTE_SERVER is disabled, but no server binary exists on the server"
+            )
+        }
+    }
+
+    if let Some(bundled_path) = bundled_remote_server_path(platform) {
+        delegate.set_status(Some("Using bundled remote server binary"), cx);
+        log::info!(
+            "using bundled remote server binary at {}",
+            bundled_path.display()
+        );
+        return Ok(Some(bundled_path));
     }
 
     async fn run_cmd(command: &mut Command) -> Result<()> {
@@ -288,6 +373,17 @@ async fn build_remote_server_from_source(
             String::from_utf8_lossy(&output.stderr)
         );
         Ok(())
+    }
+
+    fn new_cargo_command(_build_release: bool) -> Command {
+        #[cfg(target_os = "macos")]
+        if _build_release {
+            // Thin LTO opens more object files than launchd's default 256-descriptor limit.
+            let mut command = new_command("/bin/sh");
+            command.args(["-c", "ulimit -n 4096 && exec cargo \"$@\"", "cargo"]);
+            return command;
+        }
+        new_command("cargo")
     }
 
     let use_musl = !build_remote_server.contains("nomusl");
@@ -321,28 +417,52 @@ async fn build_remote_server_from_source(
             rust_flags.push_str(&format!(" -C link-arg=-L{path}"));
         }
     }
+    let build_release = !cfg!(debug_assertions);
+    let build_key = format!("{triple}\0{build_release}\0{build_remote_server}\0{rust_flags}");
+    let build_requested_at = std::time::Instant::now();
+    let mut built_remote_server = REMOTE_SERVER_BUILD_LOCK.lock().await;
+    if let Some(cached_build) = built_remote_server.as_ref() {
+        // Only concurrent callers reuse a completed build, so a later dev connection still
+        // notices source changes through Cargo's normal incremental rebuild.
+        if cached_build.key == build_key
+            && cached_build.completed_at >= build_requested_at
+            && cached_build.path.is_file()
+        {
+            log::info!(
+                "reusing remote server binary built by this process at {}",
+                cached_build.path.display()
+            );
+            return Ok(Some(cached_build.path.clone()));
+        }
+    }
+
     if platform.arch.as_str() == std::env::consts::ARCH
         && platform.os.as_str() == std::env::consts::OS
     {
         delegate.set_status(Some("Building remote server binary from source"), cx);
         log::info!("building remote server binary from source");
-        run_cmd(
-            new_command("cargo")
-                .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
-                .args([
-                    "build",
-                    "--package",
-                    "remote_server",
-                    "--features",
-                    "debug-embed",
-                    "--target-dir",
-                    "target/remote_server",
-                    "--target",
-                    &triple,
-                ])
-                .env("RUSTFLAGS", &rust_flags),
-        )
-        .await?;
+        let mut command = new_cargo_command(build_release);
+        command
+            .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
+            .args([
+                "build",
+                "--package",
+                "remote_server",
+                "--features",
+                "debug-embed",
+                "--target-dir",
+                "target/remote_server",
+                "--target",
+                &triple,
+            ])
+            .env("RUSTFLAGS", &rust_flags);
+        if build_release {
+            command
+                .arg("--release")
+                .env("CARGO_PROFILE_RELEASE_DEBUG", "0")
+                .env("CARGO_PROFILE_RELEASE_STRIP", "symbols");
+        }
+        run_cmd(&mut command).await?;
     } else {
         if which("zig", cx).await?.is_none() {
             anyhow::bail!(if cfg!(not(windows)) {
@@ -372,29 +492,34 @@ async fn build_remote_server_from_source(
             cx,
         );
         log::info!("building remote binary from source for {triple} with Zig");
-        run_cmd(
-            new_command("cargo")
-                .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
-                .args([
-                    "zigbuild",
-                    "--package",
-                    "remote_server",
-                    "--features",
-                    "debug-embed",
-                    "--target-dir",
-                    "target/remote_server",
-                    "--target",
-                    &triple,
-                ])
-                .env("RUSTFLAGS", &rust_flags),
-        )
-        .await?;
+        let mut command = new_cargo_command(build_release);
+        command
+            .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
+            .args([
+                "zigbuild",
+                "--package",
+                "remote_server",
+                "--features",
+                "debug-embed",
+                "--target-dir",
+                "target/remote_server",
+                "--target",
+                &triple,
+            ])
+            .env("RUSTFLAGS", &rust_flags);
+        if build_release {
+            command
+                .arg("--release")
+                .env("CARGO_PROFILE_RELEASE_DEBUG", "0")
+                .env("CARGO_PROFILE_RELEASE_STRIP", "symbols");
+        }
+        run_cmd(&mut command).await?;
     };
     let bin_path = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
         .join("target")
         .join("remote_server")
         .join(&triple)
-        .join("debug")
+        .join(if build_release { "release" } else { "debug" })
         .join("remote_server")
         .with_extension(if platform.os.is_windows() { "exe" } else { "" });
 
@@ -432,6 +557,12 @@ async fn build_remote_server_from_source(
         bin_path
     };
 
+    *built_remote_server = Some(BuiltRemoteServer {
+        key: build_key,
+        path: path.clone(),
+        completed_at: std::time::Instant::now(),
+    });
+
     Ok(Some(path))
 }
 
@@ -457,6 +588,39 @@ async fn which(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_bundled_remote_server_path_for_executable() {
+        let temporary_directory = tempfile::tempdir().unwrap();
+        let contents_directory = temporary_directory.path().join("Zed Tmux.app/Contents");
+        let executable_path = contents_directory.join("MacOS/zed");
+        let remote_servers_directory = contents_directory.join("Resources/remote_servers");
+        std::fs::create_dir_all(&remote_servers_directory).unwrap();
+        let bundled_path = remote_servers_directory.join(BUNDLED_LINUX_X86_64_REMOTE_SERVER);
+        std::fs::write(&bundled_path, []).unwrap();
+
+        assert_eq!(
+            bundled_remote_server_path_for_executable(
+                &RemotePlatform {
+                    os: RemoteOs::Linux,
+                    arch: RemoteArch::X86_64,
+                },
+                &executable_path,
+            ),
+            Some(bundled_path)
+        );
+        assert_eq!(
+            bundled_remote_server_path_for_executable(
+                &RemotePlatform {
+                    os: RemoteOs::Linux,
+                    arch: RemoteArch::Aarch64,
+                },
+                &executable_path,
+            ),
+            None
+        );
+    }
 
     #[test]
     fn test_parse_platform() {

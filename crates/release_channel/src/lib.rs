@@ -9,6 +9,11 @@ use semver::Version;
 
 const ZED_DOCS_URL: &str = "https://zed.dev/docs";
 
+#[doc(hidden)]
+pub fn is_zed_tmux_build() -> bool {
+    cfg!(target_os = "macos") && option_env!("ZED_MACOS_APP_VARIANT") == Some("tmux")
+}
+
 /// stable | dev | nightly | preview
 pub static RELEASE_CHANNEL_NAME: LazyLock<String> = LazyLock::new(|| {
     if cfg!(debug_assertions) {
@@ -191,6 +196,7 @@ impl ReleaseChannel {
     /// Returns the display name for this [`ReleaseChannel`].
     pub fn display_name(&self) -> &'static str {
         match self {
+            ReleaseChannel::Dev if is_zed_tmux_build() => "Zed Tmux",
             ReleaseChannel::Dev => "Zed Dev",
             ReleaseChannel::Nightly => "Zed Nightly",
             ReleaseChannel::Preview => "Zed Preview",
@@ -213,6 +219,7 @@ impl ReleaseChannel {
     /// This also has to match the bundle identifier for Zed on macOS.
     pub fn app_id(&self) -> &'static str {
         match self {
+            ReleaseChannel::Dev if is_zed_tmux_build() => "dev.zed.Zed-Tmux",
             ReleaseChannel::Dev => "dev.zed.Zed-Dev",
             ReleaseChannel::Nightly => "dev.zed.Zed-Nightly",
             ReleaseChannel::Preview => "dev.zed.Zed-Preview",
