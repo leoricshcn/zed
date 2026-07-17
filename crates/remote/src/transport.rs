@@ -20,7 +20,10 @@ pub mod mock;
 pub mod ssh;
 pub mod wsl;
 
-#[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
+#[cfg(all(
+    target_os = "macos",
+    any(debug_assertions, feature = "build-remote-server-binary")
+))]
 const BUNDLED_LINUX_X86_64_REMOTE_SERVER: &str = "zed-remote-server-linux-x86_64.gz";
 
 #[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
@@ -35,7 +38,10 @@ static REMOTE_SERVER_BUILD_LOCK: std::sync::LazyLock<
     futures::lock::Mutex<Option<BuiltRemoteServer>>,
 > = std::sync::LazyLock::new(|| futures::lock::Mutex::new(None));
 
-#[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
+#[cfg(all(
+    target_os = "macos",
+    any(debug_assertions, feature = "build-remote-server-binary")
+))]
 fn bundled_remote_server_path_for_executable(
     platform: &RemotePlatform,
     executable_path: &std::path::Path,
@@ -369,9 +375,9 @@ async fn build_remote_server_from_source(
         Ok(())
     }
 
-    fn new_cargo_command(build_release: bool) -> Command {
+    fn new_cargo_command(_build_release: bool) -> Command {
         #[cfg(target_os = "macos")]
-        if build_release {
+        if _build_release {
             // Thin LTO opens more object files than launchd's default 256-descriptor limit.
             let mut command = new_command("/bin/sh");
             command.args(["-c", "ulimit -n 4096 && exec cargo \"$@\"", "cargo"]);
