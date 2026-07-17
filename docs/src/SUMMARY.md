@@ -23,6 +23,7 @@
   - [Tab Switcher](./tab-switcher.md)
 - [Running & Testing](./running-testing.md)
   - [Terminal](./terminal.md)
+    - [Tmux Terminals](./tmux-terminals.md)
   - [Tasks](./tasks.md)
   - [Debugger](./debugger.md)
   - [REPL](./repl.md)
